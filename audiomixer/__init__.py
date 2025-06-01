@@ -10,7 +10,7 @@ import soundfile as sf
 import os
 import gc
 import warnings
-from typing import Union, Optional, Callable, Dict, Set, Tuple, Any
+from typing import Union, Optional, Callable, Dict, Set, Tuple, Any, List
 import numpy.typing as npt
 from collections import deque
 
@@ -950,4 +950,197 @@ class AudioEngine:
         
         # Use daemon thread to execute state update
         threading.Thread(target=update_states, daemon=True).start()
+
+    def get_track_info(self, track_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取音轨详细信息
+        :param track_id: 音轨ID
+        :return: 音轨信息字典，如果音轨不存在则返回None
+        """
+        with self.lock:
+            if track_id not in self.tracks:
+                return None
+            
+            state = self.track_states[track_id]
+            audio_data = self.tracks[track_id]
+            
+            return {
+                'track_id': track_id,
+                'duration': len(audio_data) / self.sample_rate,
+                'position': state['position'] / self.sample_rate,
+                'volume': state.get('volume', 1.0),
+                'playing': state.get('playing', False),
+                'paused': state.get('paused', False),
+                'loop': state.get('loop', False),
+                'speed': state.get('speed', 1.0),
+                'fade_direction': state.get('fade_direction'),
+                'fade_duration': state.get('fade_duration', 0.05),
+                'file_path': self.track_files.get(track_id),
+                'samples': len(audio_data),
+                'channels': audio_data.shape[1]
+            }
+    
+    def list_tracks(self) -> List[Dict[str, Any]]:
+        """
+        获取所有已加载音轨的列表
+        :return: 音轨信息列表
+        """
+        with self.lock:
+            tracks_info = []
+            for track_id in self.tracks.keys():
+                info = self.get_track_info(track_id)
+                if info:
+                    tracks_info.append(info)
+            return tracks_info
+    
+    def get_playing_tracks(self) -> List[str]:
+        """
+        获取所有正在播放的音轨ID列表
+        :return: 正在播放的音轨ID列表
+        """
+        with self.lock:
+            return [track_id for track_id in self.active_tracks 
+                   if self.track_states[track_id].get('playing', False) 
+                   and not self.track_states[track_id].get('paused', False)]
+    
+    def get_paused_tracks(self) -> List[str]:
+        """
+        获取所有暂停的音轨ID列表
+        :return: 暂停的音轨ID列表
+        """
+        with self.lock:
+            return [track_id for track_id, state in self.track_states.items()
+                   if state.get('playing', False) and state.get('paused', False)]
+    
+    def pause_all_tracks(self) -> List[str]:
+        """
+        暂停所有正在播放的音轨
+        :return: 被暂停的音轨ID列表
+        """
+        paused_tracks = []
+        with self.lock:
+            for track_id in list(self.active_tracks):
+                state = self.track_states[track_id]
+                if state.get('playing', False) and not state.get('paused', False):
+                    state['paused'] = True
+                    paused_tracks.append(track_id)
+            
+            if paused_tracks:
+                logger.info(f"暂停了 {len(paused_tracks)} 个音轨: {paused_tracks}")
+        
+        return paused_tracks
+    
+    def resume_all_tracks(self) -> List[str]:
+        """
+        恢复所有暂停的音轨
+        :return: 被恢复的音轨ID列表
+        """
+        resumed_tracks = []
+        with self.lock:
+            for track_id, state in self.track_states.items():
+                if state.get('playing', False) and state.get('paused', False):
+                    state['paused'] = False
+                    resumed_tracks.append(track_id)
+            
+            if resumed_tracks:
+                logger.info(f"恢复了 {len(resumed_tracks)} 个音轨: {resumed_tracks}")
+        
+        return resumed_tracks
+    
+    def stop_all_tracks(self, fade_out: bool = True) -> List[str]:
+        """
+        停止所有正在播放的音轨
+        :param fade_out: 是否使用淡出效果
+        :return: 被停止的音轨ID列表
+        """
+        stopped_tracks = []
+        with self.lock:
+            for track_id in list(self.active_tracks):
+                if self.track_states[track_id].get('playing', False):
+                    self.stop(track_id, fade_out=fade_out)
+                    stopped_tracks.append(track_id)
+            
+            if stopped_tracks:
+                logger.info(f"停止了 {len(stopped_tracks)} 个音轨: {stopped_tracks}")
+        
+        return stopped_tracks
+    
+    def remove_track(self, track_id: str, fade_out: bool = True) -> bool:
+        """
+        移除音轨（先停止播放，然后卸载）
+        :param track_id: 音轨ID
+        :param fade_out: 是否使用淡出效果停止播放
+        :return: 是否成功移除
+        """
+        with self.lock:
+            if track_id not in self.tracks:
+                logger.warning(f"音轨不存在: {track_id}")
+                return False
+            
+            # 如果正在播放，先停止
+            if self.track_states[track_id].get('playing', False):
+                self.stop(track_id, fade_out=fade_out)
+                logger.info(f"停止播放音轨: {track_id}")
+            
+            # 卸载音轨
+            success = self.unload_track(track_id)
+            if success:
+                logger.info(f"成功移除音轨: {track_id}")
+            
+            return success
+    
+    def is_track_playing(self, track_id: str) -> bool:
+        """
+        检查音轨是否正在播放
+        :param track_id: 音轨ID
+        :return: 是否正在播放
+        """
+        with self.lock:
+            if track_id not in self.track_states:
+                return False
+            state = self.track_states[track_id]
+            return state.get('playing', False) and not state.get('paused', False)
+    
+    def is_track_paused(self, track_id: str) -> bool:
+        """
+        检查音轨是否暂停
+        :param track_id: 音轨ID
+        :return: 是否暂停
+        """
+        with self.lock:
+            if track_id not in self.track_states:
+                return False
+            state = self.track_states[track_id]
+            return state.get('playing', False) and state.get('paused', False)
+    
+    def is_track_loaded(self, track_id: str) -> bool:
+        """
+        检查音轨是否已加载
+        :param track_id: 音轨ID
+        :return: 是否已加载
+        """
+        with self.lock:
+            return track_id in self.tracks
+    
+    def get_track_count(self) -> Dict[str, int]:
+        """
+        获取音轨数量统计
+        :return: 包含各种状态音轨数量的字典
+        """
+        with self.lock:
+            total = len(self.tracks)
+            playing = len([t for t in self.active_tracks 
+                          if self.track_states[t].get('playing', False) 
+                          and not self.track_states[t].get('paused', False)])
+            paused = len([t for t, s in self.track_states.items()
+                         if s.get('playing', False) and s.get('paused', False)])
+            
+            return {
+                'total': total,
+                'playing': playing,
+                'paused': paused,
+                'stopped': total - playing - paused,
+                'max_tracks': self.max_tracks,
+                'available_slots': self.max_tracks - total
+            }
 
