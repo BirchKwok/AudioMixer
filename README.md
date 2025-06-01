@@ -1,7 +1,5 @@
 # AudioMixer
 
-[![Tests](https://github.com/yourusername/audiomixer/actions/workflows/test.yml/badge.svg)](https://github.com/yourusername/audiomixer/actions/workflows/test.yml)
-[![CI/CD Pipeline](https://github.com/yourusername/audiomixer/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/yourusername/audiomixer/actions/workflows/ci-cd.yml)
 [![PyPI version](https://badge.fury.io/py/audiomixer.svg)](https://badge.fury.io/py/audiomixer)
 [![Python versions](https://img.shields.io/pypi/pyversions/audiomixer.svg)](https://pypi.org/project/audiomixer/)
 [![License](https://img.shields.io/github/license/yourusername/audiomixer.svg)](LICENSE)
@@ -233,38 +231,6 @@ pytest tests/ -v --cov=audiomixer
 pytest tests/test_audiomixer.py::TestAudioEngine::test_load_track_from_array -v
 ```
 
-### Release Process
-We use automated releases through GitHub Actions:
-
-1. **For patch releases:**
-   ```bash
-   python scripts/release.py patch
-   git push origin main
-   git push origin v1.0.1
-   ```
-
-2. **For minor releases:**
-   ```bash
-   python scripts/release.py minor
-   git push origin main
-   git push origin v1.1.0
-   ```
-
-3. **For major releases:**
-   ```bash
-   python scripts/release.py major
-   git push origin main
-   git push origin v2.0.0
-   ```
-
-### CI/CD Pipeline
-- ✅ **Automated testing** on multiple Python versions (3.8-3.12)
-- ✅ **Multi-platform testing** (Ubuntu, Windows, macOS)
-- ✅ **Code quality checks** (flake8, mypy, bandit)
-- ✅ **Security scanning** (safety, bandit)
-- ✅ **Automatic PyPI publishing** on releases
-- ✅ **Test PyPI publishing** on main branch commits
-
 ## License
 
 MIT License - see LICENSE file for details.
@@ -277,8 +243,6 @@ MIT License - see LICENSE file for details.
 4. Ensure all tests pass (`pytest tests/ -v`)
 5. Submit a pull request
 
-All pull requests are automatically tested on multiple platforms and Python versions.
-
 ## Changelog
 
 ### Version 1.0.0
@@ -287,8 +251,6 @@ All pull requests are automatically tested on multiple platforms and Python vers
 - Multi-track support
 - Audio effects and controls
 - High-performance optimization
-- Complete CI/CD pipeline
-- Comprehensive documentation
 
 ## Support
 

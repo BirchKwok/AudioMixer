@@ -13,7 +13,6 @@ import warnings
 from typing import Union, Optional, Callable, Dict, Set, Tuple, Any
 import numpy.typing as npt
 from collections import deque
-from enum import Enum
 
 
 # Configure logging
