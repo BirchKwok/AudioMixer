@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiomixer"
+version = "1.0.0"
+description = "A high-performance real-time audio mixing engine for Python"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+maintainers = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["audio", "mixer", "real-time", "sounddevice", "numpy"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Mixers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "numpy>=1.19.0",
+    "sounddevice>=0.4.0",
+    "soundfile>=0.10.0",
+]
+
+[project.optional-dependencies]
+high-quality = [
+    "librosa>=0.8.0",
+    "scipy>=1.7.0",
+]
+time-stretch = [
+    "pyrubberband>=0.3.0",
+]
+all = [
+    "librosa>=0.8.0",
+    "scipy>=1.7.0",
+    "pyrubberband>=0.3.0",
+]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+    "pre-commit",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/audiomixer"
+Documentation = "https://github.com/yourusername/audiomixer#readme"
+Repository = "https://github.com/yourusername/audiomixer.git"
+"Bug Tracker" = "https://github.com/yourusername/audiomixer/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["audiomixer*"]
+
+[tool.setuptools.package-data]
+audiomixer = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers"
+testpaths = [
+    "tests",
+]
+python_files = [
+    "test_*.py",
+    "*_test.py",
+] 

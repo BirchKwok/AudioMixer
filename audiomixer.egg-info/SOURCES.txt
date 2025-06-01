@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+audiomixer/__init__.py
+audiomixer/py.typed
+audiomixer.egg-info/PKG-INFO
+audiomixer.egg-info/SOURCES.txt
+audiomixer.egg-info/dependency_links.txt
+audiomixer.egg-info/requires.txt
+audiomixer.egg-info/top_level.txt
+tests/test_audiomixer.py
