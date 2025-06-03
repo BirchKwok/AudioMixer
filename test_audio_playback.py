@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-音频混音器测试脚本 - 主音轨和副音轨播放测试
+音频混音器测试脚本 - 主音轨和副音轨无缝切换测试
 
 测试目标：
 1. 主音轨播放 "声音素材.wav"
 2. 副音轨1播放 "副音轨.wav"，播放前后各有300ms静音
-3. 播放副音轨时，主音轨自动静音
-4. 检测是否有电流音或其他音频质量问题
+3. 使用AudioEngine内置的响度匹配确保音量一致性
+4. 使用AudioEngine内置的交叉淡入淡出实现无缝切换
+5. 检测是否有电流音或其他音频质量问题
 
 播放流程：
 1. 主音轨开始播放（独奏3秒）
 2. 300ms 静音
-3. 主音轨静音，副音轨开始播放
+3. 交叉淡入淡出：主音轨淡出，副音轨淡入（无缝切换）
 4. 副音轨播放完成
 5. 300ms 静音  
-6. 主音轨恢复播放
+6. 交叉淡入淡出：副音轨淡出，主音轨淡入（无缝切换）
+
+关键技术：
+- 使用engine.match_loudness()进行响度匹配
+- 使用engine.crossfade()进行交叉淡入淡出
+- 音频质量监测：检测电流音、削波、信号稳定性
 """
 
 import numpy as np
@@ -71,7 +77,8 @@ def analyze_audio_quality(engine, duration=5.0):
         'underrun_detected': unexpected_drops > len(stats_history) * 0.1,  # 超过10%的采样点有异常才报告
         'level_stability': np.std(peak_levels) < 0.05,  # 放宽电平稳定性阈值，音乐内容变化是正常的
         'no_clipping': np.max(peak_levels) < 0.95,  # 检测削波
-        'proper_signal': np.mean(peak_levels) > 0.001  # 确保有信号
+        'proper_signal': np.mean(peak_levels) > 0.001,  # 确保有信号
+        'peak_levels': peak_levels,  # 添加原始peak_levels数据
     }
     
     return analysis, stats_history
@@ -90,8 +97,11 @@ def print_audio_analysis(analysis):
     
     print("\n=== 音频质量检测 ===")
     
+    # 从analysis字典中获取peak_levels数据
+    peak_levels = analysis.get('peak_levels', [])
+    
     # 电流音检测（基于电平稳定性，考虑音乐内容的正常变化）
-    peak_std = np.std(peak_levels)
+    peak_std = np.std(peak_levels) if peak_levels else 0.0
     if peak_std > 0.1 and analysis['avg_peak_level'] < 0.1:
         # 只有在平均电平很低但变化很大时才可能是电流音
         print("⚠️  检测到可能的电流音或噪声（低信号高变化）")
@@ -119,7 +129,6 @@ def print_audio_analysis(analysis):
         print("✅ 音轨播放稳定")
     
     # 整体评估
-    peak_std = np.std(peak_levels)
     serious_noise = peak_std > 0.1 and analysis['avg_peak_level'] < 0.1
     
     quality_issues = sum([
@@ -140,7 +149,7 @@ def print_audio_analysis(analysis):
 def main():
     print("=== 音频混音器测试 ===")
     print("测试目标：主音轨播放'声音素材.wav'，副音轨播放'副音轨.wav'")
-    print("播放特性：副音轨前后各有300ms静音，播放时主音轨自动静音")
+    print("播放特性：副音轨前后各有300ms静音，使用AudioEngine内置的响度匹配和交叉淡入淡出实现无缝切换")
     
     # 检查音频文件是否存在
     main_audio_file = "声音素材.wav"
@@ -210,12 +219,12 @@ def main():
         if sub_info:
             print(f"副音轨1 - 时长: {sub_info['duration']:.2f}秒, 采样率: {sub_info.get('sample_rate', 'N/A')}Hz")
         
-        # 开始播放
-        print("\n开始播放测试...")
-        print("主音轨音量: 70%，副音轨播放时主音轨将静音")
+        # 开始播放测试
+        print("\n开始无缝切换播放测试...")
+        print("播放特性：副音轨前后各有300ms静音，使用AudioEngine内置的交叉淡入淡出无缝切换")
         
         # 播放主音轨
-        engine.set_volume("main_track", 0.7)  # 70% 音量
+        engine.set_volume("main_track", 0.7)
         engine.play("main_track", fade_in=True, loop=True)
         print("✅ 主音轨开始播放")
         
@@ -227,34 +236,26 @@ def main():
         print("副音轨前静音 300ms...")
         time.sleep(0.3)
         
-        # 主音轨静音，副音轨开始播放
-        print("主音轨静音，副音轨开始播放...")
-        engine.set_volume("main_track", 0.0)  # 主音轨静音
-        engine.set_volume("sub_track_1", 0.5)  # 50% 音量
-        engine.play("sub_track_1", fade_in=True, loop=False)  # 不循环播放
-        print("✅ 副音轨开始播放，主音轨已静音")
+        # 交叉淡入淡出切换到副音轨
+        print("开始无缝切换到副音轨...")
+        engine.crossfade("main_track", "sub_track_1", 0.5)
         
         # 获取副音轨时长来控制播放时间
         if sub_info and 'duration' in sub_info:
             sub_duration = sub_info['duration']
             print(f"副音轨播放中...（时长: {sub_duration:.2f}秒）")
-            # 播放副音轨的时长
             time.sleep(sub_duration)
         else:
             print("副音轨播放中...（使用默认时长5秒）")
-            time.sleep(5)  # 默认播放5秒
-        
-        # 停止副音轨
-        engine.stop("sub_track_1", fade_out=True)
-        print("副音轨播放完成")
+            time.sleep(5)
         
         # 副音轨后静音 - 300ms
         print("副音轨后静音 300ms...")
         time.sleep(0.3)
         
-        # 恢复主音轨播放
-        print("恢复主音轨播放...")
-        engine.set_volume("main_track", 0.7)  # 恢复70%音量
+        # 交叉淡入淡出切换回主音轨
+        print("开始无缝切换回主音轨...")
+        engine.crossfade("sub_track_1", "main_track", 0.5)
         print("✅ 主音轨恢复播放")
         
         # 音频质量监测（在主音轨恢复播放后）

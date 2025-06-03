@@ -1351,7 +1351,206 @@ class AudioEngine:
         with self.lock:
             if track_id in self.track_states:
                 self.track_states[track_id]['fade_duration'] = max(0.01, duration_sec)
-    
+
+    def calculate_rms_loudness(self, track_id: str, duration: float = 2.0) -> float:
+        """
+        计算音轨的RMS响度
+        
+        Args:
+            track_id (str): 音轨ID
+            duration (float): 分析时长（秒）
+        
+        Returns:
+            float: RMS响度值
+            
+        Example:
+            >>> loudness = engine.calculate_rms_loudness("bgm1", 2.0)
+            >>> print(f"音轨响度: {loudness:.4f}")
+        """
+        # 获取音轨信息
+        track_info = self.get_track_info(track_id)
+        if not track_info:
+            logger.warning(f"Track not found for loudness calculation: {track_id}")
+            return 0.0
+        
+        # 保存当前状态
+        was_playing = track_info.get('playing', False)
+        original_volume = track_info.get('volume', 1.0)
+        original_position = self.get_position(track_id)
+        
+        try:
+            # 临时播放来测量响度
+            if was_playing:
+                self.pause(track_id)
+            
+            self.set_volume(track_id, 0.01)  # 设置为很小的音量来测量
+            self.seek(track_id, 0.0)  # 从头开始测量
+            self.play(track_id, fade_in=False, loop=False)
+            
+            # 收集音频电平数据
+            levels = []
+            samples = int(duration / 0.1)  # 每100ms采样一次
+            
+            for _ in range(samples):
+                stats = self.get_performance_stats()
+                if stats['active_tracks'] > 0:
+                    levels.append(stats['peak_level'])
+                time.sleep(0.1)
+            
+            # 停止播放并恢复状态
+            self.stop(track_id, fade_out=False)
+            self.set_volume(track_id, original_volume)
+            self.seek(track_id, original_position)
+            
+            if was_playing:
+                self.resume(track_id)
+            
+            # 计算RMS
+            if levels:
+                rms = np.sqrt(np.mean(np.array(levels) ** 2))
+                logger.debug(f"RMS loudness for {track_id}: {rms:.4f}")
+                return rms
+            else:
+                logger.warning(f"No audio levels collected for {track_id}")
+                return 0.0
+                
+        except Exception as e:
+            logger.error(f"Error calculating RMS loudness for {track_id}: {str(e)}")
+            # 恢复状态
+            self.set_volume(track_id, original_volume)
+            self.seek(track_id, original_position)
+            if was_playing:
+                self.resume(track_id)
+            return 0.0
+
+    def match_loudness(self, track1_id: str, track2_id: str, target_loudness: float = 0.7) -> tuple[float, float]:
+        """
+        匹配两个音轨的响度
+        
+        Args:
+            track1_id (str): 第一个音轨ID（通常是主音轨）
+            track2_id (str): 第二个音轨ID（通常是副音轨）
+            target_loudness (float): 目标响度级别（0.0-1.0）
+        
+        Returns:
+            tuple[float, float]: (第一个音轨建议音量, 第二个音轨建议音量)
+            
+        Example:
+            >>> vol1, vol2 = engine.match_loudness("main", "sub", 0.7)
+            >>> engine.set_volume("main", vol1)
+            >>> engine.set_volume("sub", vol2)
+        """
+        logger.info(f"Matching loudness between {track1_id} and {track2_id}")
+        
+        # 计算两个音轨的RMS响度
+        rms1 = self.calculate_rms_loudness(track1_id, 1.5)
+        rms2 = self.calculate_rms_loudness(track2_id, 1.0)
+        
+        logger.info(f"RMS loudness - {track1_id}: {rms1:.4f}, {track2_id}: {rms2:.4f}")
+        
+        if rms1 > 0 and rms2 > 0:
+            # 计算音量比例，使响度匹配
+            ratio = rms1 / rms2
+            
+            # 设置音量
+            volume1 = target_loudness
+            volume2 = target_loudness * ratio
+            
+            # 限制音量范围
+            volume2 = min(1.0, max(0.1, volume2))
+            
+            logger.info(f"Loudness matching - ratio: {ratio:.3f}, volumes: {volume1:.3f}, {volume2:.3f}")
+            return volume1, volume2
+        else:
+            logger.warning("Unable to measure loudness, using default volumes")
+            return target_loudness, target_loudness * 0.8
+
+    def crossfade(self, from_track: str, to_track: str, duration: float = 1.0, 
+                 to_track_volume: Optional[float] = None, to_track_loop: bool = False) -> bool:
+        """
+        在两个音轨之间执行交叉淡入淡出
+        
+        Args:
+            from_track (str): 源音轨ID（将淡出）
+            to_track (str): 目标音轨ID（将淡入）
+            duration (float): 交叉淡入淡出持续时间（秒）
+            to_track_volume (float, optional): 目标音轨的最终音量。如果为None，将自动使用响度匹配
+            to_track_loop (bool): 目标音轨是否循环播放
+        
+        Returns:
+            bool: 是否成功开始交叉淡入淡出
+            
+        Example:
+            >>> # 简单的交叉淡入淡出
+            >>> engine.crossfade("main_track", "sub_track", 1.0)
+            
+            >>> # 带自定义音量的交叉淡入淡出
+            >>> engine.crossfade("main_track", "sub_track", 0.5, to_track_volume=0.8)
+        """
+        # 检查音轨是否存在
+        if from_track not in self.track_states or to_track not in self.track_states:
+            logger.error(f"One or both tracks not found: {from_track}, {to_track}")
+            return False
+        
+        # 获取源音轨当前音量
+        from_info = self.get_track_info(from_track)
+        if not from_info or not from_info.get('playing', False):
+            logger.warning(f"Source track {from_track} is not playing")
+            return False
+        
+        from_volume = from_info.get('volume', 0.7)
+        
+        # 确定目标音轨音量
+        if to_track_volume is None:
+            # 使用响度匹配
+            _, to_track_volume = self.match_loudness(from_track, to_track, from_volume)
+        
+        logger.info(f"Starting crossfade: {from_track} -> {to_track} ({duration}s)")
+        
+        # 设置淡入淡出时长
+        self.set_fade_duration(from_track, duration)
+        self.set_fade_duration(to_track, duration)
+        
+        # 开始目标音轨播放（从0音量开始）
+        self.set_volume(to_track, 0.0)
+        self.play(to_track, fade_in=False, loop=to_track_loop)
+        
+        # 在后台线程中执行交叉淡入淡出
+        def crossfade_worker():
+            try:
+                steps = int(duration * 20)  # 每50ms一步
+                step_duration = duration / steps
+                
+                for i in range(steps + 1):
+                    if not self.is_running:
+                        break
+                        
+                    progress = i / steps  # 0.0 到 1.0
+                    
+                    # 源音轨音量从当前音量线性减到0
+                    from_current_volume = from_volume * (1.0 - progress)
+                    self.set_volume(from_track, from_current_volume)
+                    
+                    # 目标音轨音量从0线性增到目标音量
+                    to_current_volume = to_track_volume * progress
+                    self.set_volume(to_track, to_current_volume)
+                    
+                    time.sleep(step_duration)
+                
+                # 停止源音轨
+                self.stop(from_track, fade_out=False)
+                logger.debug(f"Crossfade completed: {from_track} -> {to_track}")
+                
+            except Exception as e:
+                logger.error(f"Error during crossfade: {str(e)}")
+        
+        # 启动后台线程
+        import threading
+        crossfade_thread = threading.Thread(target=crossfade_worker, daemon=True)
+        crossfade_thread.start()
+        
+        return True
+
     def get_position(self, track_id: str) -> float:
         """
         获取当前播放位置
