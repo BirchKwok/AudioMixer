@@ -184,15 +184,43 @@ class AudioEngine:
                 task = self.loading_queue.get()
                 if task is None:  # Stop signal
                     break
-                    
-                track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback = task
+                
+                # 检查是否为unsampled模式（向后兼容）
+                if len(task) == 10:  # 包含unsampled标志
+                    track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback, unsampled = task
+                else:  # 原有格式
+                    track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback = task
+                    unsampled = False
                 
                 if isinstance(source, str):
                     # File path
-                    self._load_track_from_file_optimized(track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
+                    if unsampled:
+                        self._load_track_from_file_unsampled(track_id, source, speed, auto_normalize, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
+                    else:
+                        self._load_track_from_file_optimized(track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
                 else:
-                    # NumPy array
-                    self._process_audio_data(track_id, source, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+                    # NumPy array or array-like object
+                    # Extract actual numpy array if it's wrapped
+                    actual_array = getattr(source, 'data', source) if hasattr(source, 'data') else source
+                    
+                    if unsampled:
+                        # For numpy arrays in unsampled mode, we need a way to specify the sample rate
+                        # Since numpy arrays don't have inherent sample rate info, we'll use a default
+                        # or require the user to attach it as metadata
+                        if hasattr(source, 'sample_rate'):
+                            original_sample_rate = source.sample_rate
+                            logger.info(f"使用包装对象的采样率: {original_sample_rate}Hz")
+                        else:
+                            # For unsampled mode without explicit sample rate, we must use the engine's rate
+                            # This is a limitation - for numpy arrays, users should use the regular load_track
+                            # with explicit sample_rate parameter for different rates
+                            logger.warning(f"NumPy数组在unsampled模式下没有指定采样率，使用引擎采样率 {self.sample_rate}Hz")
+                            original_sample_rate = self.sample_rate
+                        
+                        self._process_audio_data(track_id, actual_array, auto_normalize, original_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+                    else:
+                        self._process_audio_data(track_id, actual_array, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+                    
                     if on_complete:
                         on_complete(track_id, True)
                 
@@ -629,6 +657,10 @@ class AudioEngine:
         :param silent_lpadding_ms: Silent padding duration in milliseconds (added before audio)
         :param silent_rpadding_ms: Silent padding duration in milliseconds (added after audio)
         """
+        # 确保音频数据是真正的numpy数组
+        if not isinstance(audio_data, np.ndarray):
+            audio_data = np.asarray(audio_data, dtype=np.float32)
+        
         # 确定音轨的采样率
         if track_sample_rate is None:
             track_sample_rate = self.sample_rate
@@ -3360,4 +3392,212 @@ class AudioEngine:
         except Exception as e:
             logger.error(f"播放定时轨道失败 {track_id}: {e}")
             return False
+
+    def load_track_unsampled(self, track_id: str, source: Union[npt.NDArray, str], 
+                           speed: float = 1.0, auto_normalize: bool = True,
+                           silent_lpadding_ms: float = 0.0,
+                           silent_rpadding_ms: float = 0.0,
+                           on_complete: Optional[Callable] = None,
+                           progress_callback: Optional[Callable] = None) -> bool:
+        """
+        加载音轨数据（保持原始采样率，不进行重采样）
+        
+        支持从文件路径或NumPy数组加载音频数据，但保持音频的原始采样率不变。
+        这对于需要精确保持音频原始特性的应用场景很有用。
+        
+        Args:
+            track_id (str): 轨道唯一标识符
+            source (Union[np.ndarray, str]): 音频源（NumPy数组或文件路径）
+            speed (float, optional): 播放速度倍数（0.1-4.0）. Defaults to 1.0.
+            auto_normalize (bool, optional): 是否自动音量标准化. Defaults to True.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
+            on_complete (callable, optional): 加载完成回调函数. Defaults to None.
+                格式：on_complete(track_id, success, error=None)
+            progress_callback (callable, optional): 进度回调函数. Defaults to None.
+                格式：progress_callback(track_id, progress: 0.0-1.0, message)
+                
+        Returns:
+            bool: 是否成功开始加载（异步操作）
+            
+        Note:
+            - 文件路径：音频将保持原始采样率，不会重采样到引擎采样率
+            - NumPy数组：由于数组本身不包含采样率信息，将使用引擎采样率
+                - 如果需要不同的采样率，请使用 load_track() 方法并指定 sample_rate 参数
+                - 或者给数组添加 sample_rate 属性：array.sample_rate = 44100
+            - 播放时会进行实时采样率转换以适配音频引擎
+            - 大文件自动使用分块加载，但不支持流式播放（因为需要保持原始采样率）
+            
+        Example:
+            >>> # 加载文件（保持原始采样率）
+            >>> def on_load_complete(track_id, success, error=None):
+            ...     if success:
+            ...         print(f"轨道 {track_id} 加载成功（保持原始采样率）")
+            ...     else:
+            ...         print(f"轨道 {track_id} 加载失败: {error}")
+            ...
+            >>> success = engine.load_track_unsampled(
+            ...     track_id="original_quality",
+            ...     source="/path/to/music.wav",
+            ...     speed=1.0,
+            ...     auto_normalize=True,
+            ...     silent_lpadding_ms=300.0,
+            ...     on_complete=on_load_complete
+            ... )
+            
+            >>> # 加载带采样率信息的NumPy数组
+            >>> audio_data = np.random.randn(44100, 2).astype(np.float32)
+            >>> audio_data.sample_rate = 44100  # 添加采样率属性
+            >>> engine.load_track_unsampled("test", audio_data)
+        """
+        # Validate speed range
+        speed = max(0.1, min(4.0, speed))
+        
+        # Validate silent padding
+        silent_lpadding_ms = max(0.0, silent_lpadding_ms)
+        silent_rpadding_ms = max(0.0, silent_rpadding_ms)
+        
+        # Check track count limit
+        with self.lock:
+            if len(self.track_states) >= self.max_tracks:
+                error = f"Track limit reached ({self.max_tracks}), cannot load more tracks"
+                logger.warning(error)
+                if on_complete:
+                    on_complete(track_id, False, error)
+                return False
+            
+            # If track already exists, unload it first
+            if track_id in self.track_states:
+                self.unload_track(track_id)
+        
+        # Handle different source types
+        if isinstance(source, np.ndarray):
+            # For numpy arrays, we need to determine the original sample rate
+            # Since it's not provided, we'll use engine sample rate but mark it as unsampled
+            self.loading_queue.put((track_id, source, speed, auto_normalize, None, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback, True))  # True indicates unsampled mode
+            return True
+        elif hasattr(source, 'shape') and hasattr(source, 'dtype'):
+            # Array-like object (including custom wrapper classes)
+            self.loading_queue.put((track_id, source, speed, auto_normalize, None, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback, True))
+            return True
+        elif isinstance(source, str) and os.path.isfile(source):
+            # For files, add unsampled flag to loading queue
+            self.loading_queue.put((track_id, source, speed, auto_normalize, None, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback, True))  # True indicates unsampled mode
+            return True
+        else:
+            error = f"Unsupported source type: {type(source)}"
+            logger.error(error)
+            if on_complete:
+                on_complete(track_id, False, error)
+            return False
+
+    def _load_track_from_file_unsampled(self, track_id: str, file_path: str, speed: float,
+                                      auto_normalize: bool, silent_lpadding_ms: float, silent_rpadding_ms: float,
+                                      on_complete: Optional[Callable], 
+                                      progress_callback: Optional[Callable]) -> None:
+        """
+        加载音频文件（保持原始采样率，不进行重采样）
+        
+        Args:
+            track_id (str): 轨道ID
+            file_path (str): 音频文件路径
+            speed (float): 播放速度倍数
+            auto_normalize (bool): 是否自动音量标准化
+            silent_lpadding_ms (float): 音频前面的静音填充时长（毫秒）
+            silent_rpadding_ms (float): 音频后面的静音填充时长（毫秒）
+            on_complete (callable, optional): 完成回调函数
+            progress_callback (callable, optional): 进度回调函数
+        """
+        try:
+            logger.info(f"加载音频文件（保持原始采样率）: {file_path} (speed={speed:.2f})")
+            
+            if progress_callback:
+                progress_callback(track_id, 0.1, "读取音频文件...")
+            
+            # Use soundfile to read audio file
+            data, orig_sample_rate = sf.read(file_path, dtype='float32', always_2d=True)
+            
+            logger.info(f"原始采样率: {orig_sample_rate}Hz, 数据长度: {len(data)}帧")
+            
+            if progress_callback:
+                progress_callback(track_id, 0.5, "处理音频数据...")
+            
+            # Apply speed adjustment (不进行重采样到引擎采样率)
+            if abs(speed - 1.0) > 0.01:
+                logger.info(f"应用时间拉伸（倍数={speed:.2f}）")
+                # 使用原始采样率进行时间拉伸
+                data = self._time_stretch_unsampled(data, speed, orig_sample_rate)
+            
+            if progress_callback:
+                progress_callback(track_id, 0.8, "完成音频处理...")
+            
+            # Process audio data (保持原始采样率)
+            self._process_audio_data(track_id, data, auto_normalize, orig_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+            
+            # Cache file path
+            with self.lock:
+                self.track_files[track_id] = file_path
+            
+            if progress_callback:
+                progress_callback(track_id, 1.0, f"加载完成，保持原始采样率 {orig_sample_rate}Hz")
+            
+            logger.info(f"轨道加载完成（保持原始采样率）: {track_id} ({len(data)}帧, {orig_sample_rate}Hz)")
+            if on_complete:
+                on_complete(track_id, True)
+                
+        except Exception as e:
+            logger.error(f"文件加载失败（unsampled模式）: {str(e)}")
+            if on_complete:
+                on_complete(track_id, False, str(e))
+
+    def _time_stretch_unsampled(self, data: npt.NDArray, speed: float, sample_rate: int) -> npt.NDArray:
+        """
+        时间拉伸（保持原始采样率）
+        
+        Args:
+            data: 音频数据
+            speed: 速度倍数
+            sample_rate: 音频的原始采样率
+            
+        Returns:
+            拉伸后的音频数据
+        """
+        # Try to use high-quality time stretching libraries
+        try:
+            import pyrubberband as rb
+            logger.info("使用 pyrubberband 进行高质量时间拉伸")
+            stretched_data = np.zeros_like(data)
+            for channel in range(data.shape[1]):
+                stretched_data[:, channel] = rb.time_stretch(data[:, channel], sample_rate, speed)
+            return stretched_data
+        except ImportError:
+            pass
+        
+        # Try librosa as fallback
+        try:
+            import librosa
+            logger.info("使用 librosa 进行时间拉伸")
+            stretched_data = np.zeros_like(data)
+            for channel in range(data.shape[1]):
+                stretched_data[:, channel] = librosa.effects.time_stretch(
+                    data[:, channel], 
+                    rate=speed
+                )
+            return stretched_data
+        except ImportError:
+            pass
+        
+        # Fallback to basic resampling (will change pitch)
+        logger.warning("使用基本重采样进行时间拉伸（安装 pyrubberband 或 librosa 以获得更好的质量）")
+        orig_length = data.shape[0]
+        target_length = int(orig_length / speed)
+        
+        # Use linear interpolation
+        orig_times = np.arange(orig_length)
+        target_times = np.linspace(0, orig_length-1, target_length)
+        resampled = np.zeros((target_length, data.shape[1]), dtype=np.float32)
+        for channel in range(data.shape[1]):
+            resampled[:, channel] = np.interp(target_times, orig_times, data[:, channel])
+        
+        return resampled
 

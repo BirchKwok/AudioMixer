@@ -26,6 +26,6 @@ __all__ = [
     'logger'
 ]
 
-__version__ = '1.0.2'
+__version__ = '1.1.0'
 __author__ = 'RealtimeMix Team'
 

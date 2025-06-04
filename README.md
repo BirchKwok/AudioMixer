@@ -7,6 +7,7 @@
 - **实时音频混音** - 低延迟音频处理，可配置缓冲区大小
 - **多轨支持** - 同时处理多达32+个音频轨道
 - **高质量音频处理** - 支持各种采样率和声道配置
+- **原始采样率保持** - 支持加载音频时保持原始采样率，避免不必要的重采样
 - **高级音频效果** - 淡入淡出、音量控制、变速调节和循环播放
 - **内存高效** - 优化的缓冲池和内存管理
 - **线程安全** - 支持多线程应用程序安全使用
@@ -63,6 +64,9 @@ engine.load_track("background_music", "path/to/music.wav", auto_normalize=True)
 # 从numpy数组加载音频
 audio_data = np.random.randn(48000, 2).astype(np.float32)  # 1秒立体声噪音
 engine.load_track("noise", audio_data)
+
+# 加载音频并保持原始采样率（适用于高质量音频处理）
+engine.load_track_unsampled("hq_audio", "path/to/high_quality.wav")
 
 # 播放音轨
 engine.play("background_music", loop=True, fade_in=True)
@@ -183,6 +187,115 @@ def on_progress(track_id, progress):
 engine.load_track("big_file", "huge_audio.wav", 
                  progress_callback=on_progress)
 ```
+
+##### load_track_unsampled()
+
+加载音频数据到轨道（保持原始采样率，不进行重采样）。
+
+与`load_track()`不同，此方法会保持音频文件的原始采样率，不会强制重采样到引擎采样率。这对于需要精确保持音频原始特性的应用场景很有用，例如音频分析、高质量音频处理或需要保持原始音频精度的专业应用。
+
+```python
+load_track_unsampled(track_id, source, speed=1.0, auto_normalize=True, 
+                   silent_lpadding_ms=0.0, silent_rpadding_ms=0.0, 
+                   on_complete=None, progress_callback=None)
+```
+
+**参数说明：**
+- `track_id` (str): 唯一的轨道标识符
+- `source` (str | np.ndarray): 音频文件路径或numpy数组
+- `speed` (float): 播放速度倍数，默认1.0
+- `auto_normalize` (bool): 是否自动标准化音量，默认True
+- `silent_lpadding_ms` (float): 开头静音填充时长（毫秒）
+- `silent_rpadding_ms` (float): 结尾静音填充时长（毫秒）
+- `on_complete` (callable, optional): 加载完成回调函数
+- `progress_callback` (callable, optional): 进度回调函数
+
+**返回值：** `bool` - 加载是否成功启动
+
+**重要说明：**
+- **文件路径**：音频将保持原始采样率，不会重采样到引擎采样率
+- **NumPy数组**：由于数组本身不包含采样率信息，将使用引擎采样率
+  - 如需不同采样率，请使用包装类添加`sample_rate`属性
+  - 或使用`load_track()`方法并明确指定`sample_rate`参数
+- **播放时处理**：播放时会进行实时采样率转换以适配音频引擎
+- **大文件支持**：自动使用分块加载，但不支持流式播放（需保持原始采样率）
+
+**示例：**
+
+**基础用法：**
+```python
+# 加载文件（保持原始44.1kHz采样率）
+engine.load_track_unsampled("hq_music", "music_44k.wav")
+
+# 加载文件并添加静音填充
+engine.load_track_unsampled("voice_clip", "voice.wav",
+                           silent_lpadding_ms=300,  # 开头300ms静音
+                           silent_rpadding_ms=500)  # 结尾500ms静音
+
+# 使用回调监控加载过程
+def on_load_complete(track_id, success, error=None):
+    if success:
+        info = engine.get_track_info(track_id)
+        print(f"轨道 {track_id} 加载成功")
+        print(f"原始采样率: {info['sample_rate']}Hz")
+        print(f"引擎采样率: {info['engine_sample_rate']}Hz")
+        engine.play(track_id)
+    else:
+        print(f"加载失败: {error}")
+
+engine.load_track_unsampled("original_quality", "studio_master.wav",
+                           on_complete=on_load_complete)
+```
+
+**NumPy数组用法：**
+```python
+# 普通numpy数组（将使用引擎采样率）
+audio_data = np.random.randn(48000, 2).astype(np.float32)
+engine.load_track_unsampled("generated", audio_data)
+
+# 带采样率信息的包装数组
+class AudioArray:
+    def __init__(self, data, sample_rate):
+        self.data = data
+        self.sample_rate = sample_rate
+        self.shape = data.shape
+        self.dtype = data.dtype
+        self.ndim = data.ndim
+    
+    def __getattr__(self, name):
+        return getattr(self.data, name)
+    
+    def __getitem__(self, key):
+        return self.data[key]
+
+# 44.1kHz的音频数据
+audio_44k = np.random.randn(44100, 2).astype(np.float32)
+wrapped_audio = AudioArray(audio_44k, 44100)
+engine.load_track_unsampled("custom_rate", wrapped_audio)
+```
+
+**与普通load_track的对比：**
+```python
+# 方式1: 普通load_track（重采样到引擎采样率）
+engine.load_track("resampled", "music_44k.wav")  # 44.1kHz -> 48kHz
+
+# 方式2: load_track_unsampled（保持原始采样率）
+engine.load_track_unsampled("original", "music_44k.wav")  # 保持44.1kHz
+
+# 检查结果
+info1 = engine.get_track_info("resampled")
+info2 = engine.get_track_info("original")
+
+print(f"普通加载采样率: {info1['sample_rate']}Hz")      # 48000Hz
+print(f"原样加载采样率: {info2['sample_rate']}Hz")      # 44100Hz
+```
+
+**适用场景：**
+- 音频分析应用（需要保持原始采样率精度）
+- 高质量音频处理（避免不必要的重采样）
+- 多采样率音频混合（每个轨道保持各自最佳采样率）
+- 专业音频制作（保持母带质量）
+- 音频格式转换工具
 
 ##### unload_track()
 
