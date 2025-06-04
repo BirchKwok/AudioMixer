@@ -1,4 +1,4 @@
-# AudioMixer
+# realtimemix
 
 一个高性能的Python实时音频混音引擎，专为专业音频应用、游戏开发和多媒体项目设计。
 
@@ -20,28 +20,28 @@
 
 ### 基础安装
 ```bash
-pip install audiomixer
+pip install realtimemix
 ```
 
 ### 含高质量音频处理
 ```bash
-pip install audiomixer[high-quality]
+pip install realtimemix[high-quality]
 ```
 
 ### 含时间拉伸支持
 ```bash
-pip install audiomixer[time-stretch]
+pip install realtimemix[time-stretch]
 ```
 
 ### 含所有可选依赖
 ```bash
-pip install audiomixer[all]
+pip install realtimemix[all]
 ```
 
 ### 开发安装
 ```bash
-git clone https://github.com/birchkwok/audiomixer.git
-cd audiomixer
+git clone https://github.com/birchkwok/realtimemix.git
+cd realtimemix
 pip install -e .[dev]
 ```
 
@@ -49,7 +49,7 @@ pip install -e .[dev]
 
 ```python
 import numpy as np
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 # 初始化音频引擎
 engine = AudioEngine(sample_rate=48000, buffer_size=1024, channels=2)
@@ -1086,37 +1086,8 @@ scheduler.start_schedule()
 pytest tests/ -v
 
 # 运行覆盖率测试
-pytest tests/ -v --cov=audiomixer
+pytest tests/ -v --cov=realtimemix
 
 # 运行特定测试
-pytest tests/test_audiomixer.py::TestAudioEngine::test_load_track_from_array -v
+pytest tests/test_realtimemix.py::TestAudioEngine::test_load_track_from_array -v
 ```
-
-## 许可证
-
-MIT License - 详见LICENSE文件
-
-## 贡献
-
-1. Fork 代码库
-2. 创建功能分支 (`git checkout -b feature/new-feature`)
-3. 进行更改并添加测试
-4. 确保所有测试通过 (`pytest tests/ -v`)
-5. 提交Pull Request
-
-## 更新日志
-
-### Version 1.0.0
-- 初始发布
-- 实时音频混音
-- 多轨支持
-- 音频效果和控制
-- 高性能优化
-- 流式播放支持
-- 响度匹配和交叉淡入淡出
-
-## 支持
-
-如有问题和疑问：
-- GitHub Issues: https://github.com/birchkwok/audiomixer/issues
-- 文档: https://github.com/birchkwok/audiomixer#readme 

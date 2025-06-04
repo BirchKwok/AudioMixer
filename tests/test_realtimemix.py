@@ -1,5 +1,5 @@
 """
-Basic tests for AudioMixer library
+Basic tests for RealtimeMix library
 """
 
 import pytest

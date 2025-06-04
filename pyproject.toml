@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "realtimemix"
-version = "1.0.0"
+version = "1.0.2"
 description = "A high-performance real-time audio mixing engine for Python"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "Birch Kwok", email = "birchkwok@gmail.com"}
@@ -60,17 +60,17 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/birchkwok/audiomixer"
-Documentation = "https://github.com/birchkwok/audiomixer#readme"
-Repository = "https://github.com/birchkwok/audiomixer.git"
-"Bug Tracker" = "https://github.com/birchkwok/audiomixer/issues"
+Homepage = "https://github.com/birchkwok/realtimemix"
+Documentation = "https://github.com/birchkwok/realtimemix#readme"
+Repository = "https://github.com/birchkwok/realtimemix.git"
+"Bug Tracker" = "https://github.com/birchkwok/realtimemix/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["audiomixer*"]
+include = ["realtimemix*"]
 
 [tool.setuptools.package-data]
-audiomixer = ["py.typed"]
+realtimemix = ["py.typed"]
 
 [tool.black]
 line-length = 100

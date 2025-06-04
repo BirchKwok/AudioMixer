@@ -1,5 +1,5 @@
 """
-AudioMixer - 高性能多轨音频混音器
+RealtimeMix - 高性能多轨音频混音器
 
 提供完整的多轨音频播放、混音和管理功能。支持实时音频处理、
 流式播放、音效处理等功能。
@@ -26,6 +26,6 @@ __all__ = [
     'logger'
 ]
 
-__version__ = '1.0.0'
-__author__ = 'AudioMixer Team'
+__version__ = '1.0.2'
+__author__ = 'RealtimeMix Team'
 

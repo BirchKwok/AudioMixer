@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Basic AudioMixer Usage Example
+Basic RealtimeMix Usage Example
 
-This example demonstrates the core functionality of the AudioMixer library.
+This example demonstrates the core functionality of the RealtimeMix library.
 """
 
 import numpy as np
@@ -12,7 +12,7 @@ from realtimemix import AudioEngine
 
 def main():
     # Initialize the audio engine
-    print("Initializing AudioMixer...")
+    print("Initializing RealtimeMix...")
     engine = AudioEngine(
         sample_rate=48000,
         buffer_size=1024,

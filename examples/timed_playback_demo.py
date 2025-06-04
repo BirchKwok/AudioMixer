@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AudioMixer 内置定时功能演示
+RealtimeMix 内置定时功能演示
 
 演示如何使用内置的定时停止、延迟播放和自动调度功能，
 无需外部Timer，所有定时操作都由AudioEngine内部管理。
@@ -19,7 +19,7 @@ def generate_test_audio(frequency, duration, sample_rate=48000):
 
 
 def main():
-    print("=== AudioMixer 内置定时功能演示 ===")
+    print("=== RealtimeMix 内置定时功能演示 ===")
     
     # 初始化音频引擎
     engine = AudioEngine(
