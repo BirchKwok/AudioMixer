@@ -1204,3 +1204,142 @@ pytest tests/ -v --cov=realtimemix
 # 运行特定测试
 pytest tests/test_realtimemix.py::TestAudioEngine::test_load_track_from_array -v
 ```
+
+### 高级功能
+
+#### 流式播放支持
+
+对于大音频文件，RealtimeMix 提供智能的流式播放功能：
+
+```python
+# 启用流式播放（文件大小超过阈值时自动使用）
+engine = AudioEngine(
+    enable_streaming=True,
+    streaming_threshold_mb=100  # 100MB以上的文件使用流式播放
+)
+
+# 加载大文件 - 自动选择流式播放
+success = engine.load_track(
+    track_id="large_audio",
+    source="/path/to/large_audio_file.wav"
+)
+
+# 强制使用流式播放（即使文件较小）
+success = engine.force_streaming_mode(
+    track_id="streaming_audio",
+    file_path="/path/to/audio.wav"
+)
+```
+
+#### 保持原始采样率（Unsampled模式）
+
+`load_track_unsampled` 方法可以保持音频的原始采样率，避免重采样造成的音质损失：
+
+```python
+# 加载音频并保持原始采样率
+success = engine.load_track_unsampled(
+    track_id="hq_audio",
+    source="/path/to/96khz_audio.wav",  # 保持96kHz采样率
+    auto_normalize=True,
+    silent_lpadding_ms=300.0,  # 前面300ms静音
+    silent_rpadding_ms=500.0   # 后面500ms静音
+)
+
+# 支持流式播放（大文件自动使用）
+success = engine.load_track_unsampled(
+    track_id="large_hq",
+    source="/path/to/large_96khz_audio.wav"  # 自动选择流式播放
+)
+
+# 强制流式播放（保持原始采样率）
+success = engine.force_streaming_mode_unsampled(
+    track_id="forced_hq_stream",
+    file_path="/path/to/audio.wav"
+)
+```
+
+**特点：**
+- 自动选择最佳加载方式（预加载/分块加载/流式播放）
+- 保持音频原始采样率，确保最佳音质
+- 播放时实时转换到引擎采样率
+- 支持大文件的流式播放
+- 完整的静音填充支持
+
+#### 高级噪音抑制
+
+`load_track_unsampled` 包含先进的噪音抑制技术：
+
+```python
+# 加载音频并应用噪音抑制
+success = engine.load_track_unsampled(
+    track_id="clean_audio",
+    source="/path/to/noisy_audio.wav"
+)
+```
+
+**噪音抑制功能：**
+- **直流偏移移除**: 消除电流声和低频噪音
+- **高通滤波器**: 移除低频隆隆声（20Hz以下）
+- **智能噪音门**: 抑制低电平背景噪音
+- **爆音检测**: 识别并平滑突然的音量跳跃
+- **实时平滑**: 消除尖锐的音频边缘
+- **软限制器**: 防止削峰失真
+
+这些功能特别适用于：
+- 录音棚音频处理
+- 现场录音清理
+- 老旧音频文件修复
+- 高质量音频播放
+
+#### 示例：完整的高质量音频处理
+
+```python
+import numpy as np
+from realtimemix import AudioEngine
+
+# 创建高质量音频引擎
+engine = AudioEngine(
+    sample_rate=48000,
+    enable_streaming=True,
+    streaming_threshold_mb=50
+)
+
+def on_load_complete(track_id, success, error=None):
+    if success:
+        print(f"✅ 轨道 {track_id} 加载成功")
+        # 获取轨道信息
+        info = engine.get_track_info(track_id)
+        print(f"   原始采样率: {info['sample_rate']}Hz")
+        print(f"   流式模式: {info['streaming_mode']}")
+        print(f"   噪音抑制: {'已启用' if info.get('unsampled_mode') else '未启用'}")
+    else:
+        print(f"❌ 轨道 {track_id} 加载失败: {error}")
+
+# 启动引擎
+engine.start()
+
+# 加载高质量音频（自动选择最佳方式 + 噪音抑制）
+success = engine.load_track_unsampled(
+    track_id="master_track",
+    source="/path/to/high_quality_audio.wav",
+    auto_normalize=True,
+    silent_lpadding_ms=500.0,  # 500ms淡入缓冲
+    silent_rpadding_ms=1000.0, # 1秒淡出缓冲
+    on_complete=on_load_complete
+)
+
+# 播放音频
+if success:
+    engine.play("master_track", fade_in=True, loop=True)
+    
+    # 实时监控
+    import time
+    for _ in range(10):
+        stats = engine.get_performance_stats()
+        pos = engine.get_position("master_track")
+        print(f"位置: {pos:.1f}s, CPU: {stats['cpu_usage']:.1f}%, 峰值: {stats['peak_level']:.3f}")
+        time.sleep(1)
+
+# 清理
+engine.shutdown()
+```

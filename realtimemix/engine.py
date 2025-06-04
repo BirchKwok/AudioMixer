@@ -3271,7 +3271,7 @@ class AudioEngine:
 
     def _detect_and_smooth_discontinuities(self, chunk: npt.NDArray, track_id: str) -> npt.NDArray:
         """
-        检测并平滑音频不连续性，预防爆音和锐鸣声
+        检测并平滑音频不连续性，预防爆音和锐鸣声（增强版）
         
         Args:
             chunk (np.ndarray): 音频数据块
@@ -3287,19 +3287,32 @@ class AudioEngine:
         state_key = f"_last_sample_{track_id}"
         last_sample = getattr(self, state_key, None)
         
+        # 检查是否为 unsampled 模式，如果是则应用增强的噪音抑制
+        with self.lock:
+            track_state = self.track_states.get(track_id, {})
+            is_unsampled = track_state.get('unsampled_mode', False)
+        
+        if is_unsampled:
+            # 对 unsampled 模式应用完整的噪音抑制处理
+            chunk = self._apply_enhanced_noise_suppression(chunk, track_id)
+        
         if last_sample is not None and last_sample.shape[1] == chunk.shape[1]:
             # 检测不连续性 - 如果第一个样本与上一个样本差异过大
-            threshold = 0.1  # 阈值，可以根据需要调整
+            threshold = 0.1 if not is_unsampled else 0.05  # unsampled 模式使用更严格的阈值
             diff = np.abs(chunk[0] - last_sample[0])
             
             if np.any(diff > threshold):
                 # 发现不连续性，应用平滑过渡
-                smooth_length = min(16, chunk.shape[0])  # 最多16样本的平滑
+                smooth_length = min(32, chunk.shape[0])  # 最多32样本的平滑
                 if smooth_length > 0:
                     # 创建平滑过渡
                     for channel in range(chunk.shape[1]):
                         transition = np.linspace(last_sample[0, channel], chunk[0, channel], smooth_length)
                         chunk[:smooth_length, channel] = transition
+        
+        # 额外的平滑处理用于 unsampled 模式
+        if is_unsampled:
+            chunk = self._apply_additional_smoothing(chunk)
         
         # 保存最后的样本用于下次检测
         if chunk.shape[0] > 0:
@@ -3307,48 +3320,99 @@ class AudioEngine:
         
         return chunk
     
-    def _apply_audio_effects_optimized(self, chunk: npt.NDArray, state: Dict[str, Any], frames: int) -> None:
-        """Optimized audio effects application"""
-        # Apply volume
-        volume = state.get('volume', 1.0)
-        if volume != 1.0:
-            self.audio_processor.apply_volume_inplace(chunk, volume)
+    def _apply_enhanced_noise_suppression(self, chunk: npt.NDArray, track_id: str) -> npt.NDArray:
+        """
+        为 unsampled 模式应用增强的噪音抑制
         
-        # Handle fade in/out
-        fade_progress = state.get('fade_progress')
-        fade_direction = state.get('fade_direction')
-        fade_duration = state.get('fade_duration', 0.05)
+        Args:
+            chunk: 音频数据块
+            track_id: 轨道ID
+            
+        Returns:
+            处理后的音频数据
+        """
+        if chunk.shape[0] == 0:
+            return chunk
         
-        if fade_direction and fade_progress is not None:
-            # Generate or cache fade in/out steps
-            fade_key = (fade_duration, frames)
-            if fade_key not in self.fade_step_cache:
-                self.fade_step_cache[fade_key] = frames / (fade_duration * self.sample_rate)
+        processed_chunk = chunk.copy()
+        
+        with self.lock:
+            track_state = self.track_states.get(track_id, {})
+            noise_threshold = track_state.get('noise_gate_threshold', 0.001)
+            last_peak = track_state.get('last_peak_level', 0.0)
+            pop_history = track_state.get('pop_filter_history', np.zeros((8, self.channels), dtype=np.float32))
+        
+        # 1. 实时噪音门（更精细的控制）
+        current_rms = np.sqrt(np.mean(processed_chunk ** 2))
+        if current_rms < noise_threshold * 2:  # 动态调整
+            # 应用渐进式噪音门
+            gate_factor = min(1.0, current_rms / noise_threshold)
+            processed_chunk *= gate_factor ** 0.5  # 平方根曲线，更平滑
+        
+        # 2. 爆音检测和即时抑制
+        for i, sample in enumerate(processed_chunk):
+            sample_peak = np.max(np.abs(sample))
             
-            fade_step = self.fade_step_cache[fade_key]
+            # 检测突然的音量跳跃
+            if last_peak > 0 and sample_peak > last_peak * 3.0:  # 3倍跳跃被认为是爆音
+                # 应用软限制
+                for channel in range(sample.shape[0]):
+                    if abs(sample[channel]) > last_peak * 2.0:
+                        # 平滑限制到合理范围
+                        sign = np.sign(sample[channel])
+                        limited_value = sign * min(abs(sample[channel]), last_peak * 1.5)
+                        processed_chunk[i, channel] = limited_value
             
-            if fade_direction == 'in':
-                fade_end = min(1.0, fade_progress + fade_step)
-                fade_env = np.linspace(fade_progress, fade_end, frames)
-                self.audio_processor.apply_fade_inplace(chunk, fade_env)
-                
-                if fade_end >= 1.0:
-                    state['fade_progress'] = None
-                    state['fade_direction'] = None
-                else:
-                    state['fade_progress'] = fade_end
+            last_peak = max(last_peak * 0.99, sample_peak)  # 缓慢衰减的峰值跟踪
+        
+        # 3. 移动平均去除高频尖峰
+        if processed_chunk.shape[0] >= 3:
+            for channel in range(processed_chunk.shape[1]):
+                # 使用简单的3点移动平均
+                for i in range(1, processed_chunk.shape[0] - 1):
+                    current = processed_chunk[i, channel]
+                    prev_val = processed_chunk[i-1, channel]
+                    next_val = processed_chunk[i+1, channel]
+                    
+                    # 检测尖峰
+                    if abs(current - prev_val) > 0.1 and abs(current - next_val) > 0.1:
+                        # 应用轻微平滑
+                        smoothed = (prev_val + current + next_val) / 3
+                        processed_chunk[i, channel] = 0.7 * current + 0.3 * smoothed
+        
+        # 更新状态
+        with self.lock:
+            if track_id in self.track_states:
+                self.track_states[track_id]['last_peak_level'] = last_peak
+        
+        return processed_chunk
+    
+    def _apply_additional_smoothing(self, chunk: npt.NDArray) -> npt.NDArray:
+        """
+        为 unsampled 模式应用额外的平滑处理
+        
+        Args:
+            chunk: 音频数据块
             
-            elif fade_direction == 'out':
-                fade_end = max(0.0, fade_progress - fade_step)
-                fade_env = np.linspace(fade_progress, fade_end, frames)
-                self.audio_processor.apply_fade_inplace(chunk, fade_env)
-                
-                if fade_end <= 0.0:
-                    state['playing'] = False
-                    state['fade_progress'] = None
-                    state['fade_direction'] = None
-                else:
-                    state['fade_progress'] = fade_end
+        Returns:
+            平滑后的音频数据
+        """
+        if chunk.shape[0] < 3:
+            return chunk
+        
+        smoothed_chunk = chunk.copy()
+        
+        # 应用轻微的低通滤波效果
+        for channel in range(smoothed_chunk.shape[1]):
+            # 简单的指数移动平均
+            alpha = 0.9  # 平滑系数
+            for i in range(1, smoothed_chunk.shape[0]):
+                smoothed_chunk[i, channel] = (
+                    alpha * smoothed_chunk[i, channel] + 
+                    (1 - alpha) * smoothed_chunk[i-1, channel]
+                )
+        
+        return smoothed_chunk
 
     def play_for_duration(self, track_id: str, duration_sec: float, 
                          fade_in: bool = False, fade_out: bool = True, 
@@ -3400,9 +3464,10 @@ class AudioEngine:
                            on_complete: Optional[Callable] = None,
                            progress_callback: Optional[Callable] = None) -> bool:
         """
-        加载音轨数据（保持原始采样率，不进行重采样）
+        加载音轨数据（保持原始采样率，不进行重采样，支持流式播放和噪音抑制）
         
         支持从文件路径或NumPy数组加载音频数据，但保持音频的原始采样率不变。
+        会自动选择最适合的加载方式（预加载、分块加载或流式播放），并应用高级噪音抑制。
         这对于需要精确保持音频原始特性的应用场景很有用。
         
         Args:
@@ -3421,18 +3486,28 @@ class AudioEngine:
             bool: 是否成功开始加载（异步操作）
             
         Note:
+            - 自动选择最佳加载方式：
+              * 小文件：标准预加载（带噪音抑制）
+              * 大文件：分块加载（带噪音抑制）
+              * 超大文件：流式播放（带实时噪音抑制）
+            - 噪音抑制功能：
+              * 直流偏移移除（消除电流声）
+              * 高通滤波器（消除低频噪音）
+              * 噪音门（抑制低电平噪音）
+              * 爆音检测和抑制（防止突然的音量跳跃）
+              * 平滑滤波器（消除尖锐边缘）
+              * 软限制器（防止削峰失真）
             - 文件路径：音频将保持原始采样率，不会重采样到引擎采样率
             - NumPy数组：由于数组本身不包含采样率信息，将使用引擎采样率
-                - 如果需要不同的采样率，请使用 load_track() 方法并指定 sample_rate 参数
-                - 或者给数组添加 sample_rate 属性：array.sample_rate = 44100
+                - 如果需要不同的采样率，请给数组添加 sample_rate 属性
             - 播放时会进行实时采样率转换以适配音频引擎
-            - 大文件自动使用分块加载，但不支持流式播放（因为需要保持原始采样率）
+            - 流式模式暂不支持变速播放（speed != 1.0）
             
         Example:
-            >>> # 加载文件（保持原始采样率）
+            >>> # 加载文件（保持原始采样率，自动选择最佳方式）
             >>> def on_load_complete(track_id, success, error=None):
             ...     if success:
-            ...         print(f"轨道 {track_id} 加载成功（保持原始采样率）")
+            ...         print(f"轨道 {track_id} 加载成功（保持原始采样率，已应用噪音抑制）")
             ...     else:
             ...         print(f"轨道 {track_id} 加载失败: {error}")
             ...
@@ -3496,7 +3571,7 @@ class AudioEngine:
                                       on_complete: Optional[Callable], 
                                       progress_callback: Optional[Callable]) -> None:
         """
-        加载音频文件（保持原始采样率，不进行重采样）
+        加载音频文件（保持原始采样率，不进行重采样，支持流式播放）
         
         Args:
             track_id (str): 轨道ID
@@ -3511,37 +3586,282 @@ class AudioEngine:
         try:
             logger.info(f"加载音频文件（保持原始采样率）: {file_path} (speed={speed:.2f})")
             
+            # 获取文件信息
+            file_size = os.path.getsize(file_path)
+            
+            with sf.SoundFile(file_path) as f:
+                orig_sample_rate = f.samplerate
+                total_frames = f.frames
+                channels = f.channels
+                
+                logger.info(f"文件信息: {total_frames}帧, {orig_sample_rate}Hz, {channels}声道, {file_size/(1024*1024):.1f}MB")
+                
+                if progress_callback:
+                    progress_callback(track_id, 0.0, f"分析文件: {file_size/(1024*1024):.1f}MB")
+            
+            # 决定使用流式播放还是预加载模式（unsampled模式也支持流式播放）
+            use_streaming = (self.enable_streaming and 
+                           file_size >= self.streaming_threshold and 
+                           abs(speed - 1.0) < 0.01)  # 流式模式暂不支持变速播放
+            
+            if use_streaming:
+                logger.info(f"使用流式播放模式（保持原始采样率）: {file_size/(1024*1024):.1f}MB")
+                self._load_streaming_track_unsampled(track_id, file_path, auto_normalize, 
+                                                   orig_sample_rate, silent_lpadding_ms, silent_rpadding_ms, 
+                                                   on_complete, progress_callback)
+            elif file_size > self.large_file_threshold:
+                logger.info(f"使用大文件分块加载模式（保持原始采样率）: {file_size/(1024*1024):.1f}MB")
+                self._load_large_file_unsampled(track_id, file_path, speed, auto_normalize, 
+                                              orig_sample_rate, silent_lpadding_ms, silent_rpadding_ms, 
+                                              on_complete, progress_callback)
+            else:
+                logger.info(f"使用标准预加载模式（保持原始采样率）: {file_size/(1024*1024):.1f}MB")
+                # 小文件使用原有方法但保持原始采样率
+                self._load_small_file_unsampled(track_id, file_path, speed, auto_normalize, 
+                                               orig_sample_rate, silent_lpadding_ms, silent_rpadding_ms, 
+                                               on_complete, progress_callback)
+                
+        except Exception as e:
+            logger.error(f"文件加载失败（unsampled模式）: {str(e)}")
+            if on_complete:
+                on_complete(track_id, False, str(e))
+
+    def _load_streaming_track_unsampled(self, track_id: str, file_path: str, auto_normalize: bool,
+                                      original_sample_rate: int, silent_lpadding_ms: float, silent_rpadding_ms: float,
+                                      on_complete: Optional[Callable], 
+                                      progress_callback: Optional[Callable]) -> None:
+        """
+        加载流式轨道（保持原始采样率）
+        
+        创建StreamingTrackData对象来管理大文件的流式播放，但保持原始采样率。
+        """
+        try:
+            # 创建流式轨道数据（保持原始采样率）
+            streaming_track = StreamingTrackData(
+                track_id=track_id,
+                file_path=file_path,
+                engine_sample_rate=original_sample_rate,  # 使用原始采样率
+                engine_channels=self.channels,
+                buffer_seconds=15.0  # 15秒缓冲
+            )
+            
+            # 存储流式轨道
+            with self.lock:
+                # 如果已存在，先清理
+                if track_id in self.streaming_tracks:
+                    self.streaming_tracks[track_id].stop_streaming()
+                    del self.streaming_tracks[track_id]
+                
+                self.streaming_tracks[track_id] = streaming_track
+                
+                # 初始化轨道状态（兼容现有API）
+                self.track_states[track_id] = {
+                    'position': 0,
+                    'volume': 1.0,
+                    'playing': False,
+                    'loop': False,
+                    'paused': False,
+                    'muted': False,
+                    'original_volume': 1.0,
+                    'fade_progress': None,
+                    'fade_direction': None,
+                    'fade_duration': 0.05,
+                    'speed': 1.0,
+                    'resample_ratio': 1.0,
+                    'resample_phase': 0.0,
+                    'sample_rate': original_sample_rate,  # 保持原始采样率
+                    'resample_buffer': None,
+                    'streaming_mode': True,
+                    'unsampled_mode': True,  # 标记为unsampled模式
+                    'auto_normalize': auto_normalize,
+                    'silent_padding_ms': silent_lpadding_ms + silent_rpadding_ms,
+                    'silent_lpadding_ms': silent_lpadding_ms,
+                    'silent_rpadding_ms': silent_rpadding_ms,
+                    'padding_frames_start': int((silent_lpadding_ms / 1000.0) * original_sample_rate) if silent_lpadding_ms > 0 else 0,
+                    'padding_frames_end': int((silent_rpadding_ms / 1000.0) * original_sample_rate) if silent_rpadding_ms > 0 else 0,
+                    'virtual_position': 0,
+                    # 添加噪音抑制状态
+                    'noise_gate_threshold': 0.001,  # 噪音门阈值
+                    'last_peak_level': 0.0,  # 上次峰值电平
+                    'pop_filter_history': np.zeros((8, self.channels), dtype=np.float32),  # 爆音过滤历史
+                }
+                
+                # 缓存文件路径
+                self.track_files[track_id] = file_path
+            
+            # 开始流式加载
+            streaming_track.start_streaming()
+            
+            if progress_callback:
+                progress_callback(track_id, 1.0, f"流式轨道就绪（保持原始采样率 {original_sample_rate}Hz）")
+            
+            logger.info(f"流式轨道加载完成（保持原始采样率）: {track_id} (时长: {streaming_track.duration:.1f}秒, {original_sample_rate}Hz)")
+            
+            if on_complete:
+                on_complete(track_id, True)
+                
+        except Exception as e:
+            logger.error(f"流式轨道加载失败（unsampled模式）: {str(e)}")
+            if on_complete:
+                on_complete(track_id, False, str(e))
+
+    def _load_large_file_unsampled(self, track_id: str, file_path: str, speed: float,
+                                 auto_normalize: bool, original_sample_rate: int,
+                                 silent_lpadding_ms: float, silent_rpadding_ms: float,
+                                 on_complete: Optional[Callable], 
+                                 progress_callback: Optional[Callable]) -> None:
+        """
+        大文件分块加载（保持原始采样率）
+        """
+        try:
+            with sf.SoundFile(file_path) as f:
+                total_frames = f.frames
+                channels = f.channels
+                
+                # 估算最终数据大小
+                final_frames = int(total_frames / speed) if abs(speed - 1.0) > 0.01 else total_frames
+                estimated_size = final_frames * self.channels * 4  # float32
+                
+                logger.info(f"预估最终大小: {estimated_size/(1024*1024):.1f}MB")
+                
+                if progress_callback:
+                    progress_callback(track_id, 0.1, "开始分块加载...")
+                
+                # 分块加载
+                chunks = []
+                processed_frames = 0
+                
+                chunk_frames = min(self.chunk_size * 128, total_frames // 10)
+                chunk_frames = max(chunk_frames, self.chunk_size)
+                
+                effective_memory_limit = min(self.max_memory_usage * 2, estimated_size)
+                merge_threshold = effective_memory_limit * 0.8
+                
+                while processed_frames < total_frames:
+                    remaining = total_frames - processed_frames
+                    current_chunk_frames = min(chunk_frames, remaining)
+                    
+                    f.seek(processed_frames)
+                    chunk_data = f.read(current_chunk_frames, dtype='float32', always_2d=True)
+                    
+                    if chunk_data.shape[0] == 0:
+                        break
+                    
+                    # 应用速度调整但保持原始采样率
+                    if abs(speed - 1.0) > 0.01:
+                        chunk_data = self._time_stretch_unsampled(chunk_data, speed, original_sample_rate)
+                    
+                    # 应用噪音抑制和平滑处理
+                    chunk_data = self._apply_noise_suppression(chunk_data, track_id)
+                    
+                    chunks.append(chunk_data)
+                    processed_frames += current_chunk_frames
+                    
+                    # 更新进度
+                    progress = 0.1 + 0.8 * (processed_frames / total_frames)
+                    if progress_callback:
+                        progress_callback(track_id, progress, 
+                                        f"处理中... {processed_frames}/{total_frames}帧 ({progress*100:.1f}%)")
+                    
+                    # 内存管理
+                    current_memory = sum(chunk.nbytes for chunk in chunks)
+                    if current_memory > merge_threshold and len(chunks) > 5:
+                        logger.info(f"内存使用达到阈值: {current_memory/(1024*1024):.1f}MB，合并 {len(chunks)} 个块...")
+                        combined = np.concatenate(chunks, axis=0)
+                        chunks = [combined]
+                        gc.collect()
+                
+                if progress_callback:
+                    progress_callback(track_id, 0.9, "最终合并音频数据...")
+                
+                # 合并所有块
+                if chunks:
+                    final_data = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+                    
+                    # 最终处理（保持原始采样率）
+                    self._process_audio_data(track_id, final_data, auto_normalize, original_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+                    
+                    # 添加噪音抑制状态
+                    with self.lock:
+                        if track_id in self.track_states:
+                            self.track_states[track_id]['unsampled_mode'] = True
+                            self.track_states[track_id]['noise_gate_threshold'] = 0.001
+                            self.track_states[track_id]['last_peak_level'] = 0.0
+                            self.track_states[track_id]['pop_filter_history'] = np.zeros((8, self.channels), dtype=np.float32)
+                    
+                    # 缓存文件路径
+                    with self.lock:
+                        self.track_files[track_id] = file_path
+                    
+                    if progress_callback:
+                        progress_callback(track_id, 1.0, f"加载完成: {len(final_data)}帧（保持原始采样率 {original_sample_rate}Hz）")
+                    
+                    logger.info(f"大文件加载完成（保持原始采样率）: {track_id} ({len(final_data)}帧，{final_data.nbytes/(1024*1024):.1f}MB, {original_sample_rate}Hz)")
+                    if on_complete:
+                        on_complete(track_id, True)
+                else:
+                    raise ValueError("无法读取音频数据")
+                    
+        except Exception as e:
+            logger.error(f"大文件加载失败（unsampled模式）: {str(e)}")
+            if on_complete:
+                on_complete(track_id, False, str(e))
+
+    def _load_small_file_unsampled(self, track_id: str, file_path: str, speed: float,
+                                 auto_normalize: bool, original_sample_rate: int,
+                                 silent_lpadding_ms: float, silent_rpadding_ms: float,
+                                 on_complete: Optional[Callable], 
+                                 progress_callback: Optional[Callable]) -> None:
+        """
+        小文件预加载（保持原始采样率）
+        """
+        try:
             if progress_callback:
                 progress_callback(track_id, 0.1, "读取音频文件...")
             
             # Use soundfile to read audio file
-            data, orig_sample_rate = sf.read(file_path, dtype='float32', always_2d=True)
+            data, file_sample_rate = sf.read(file_path, dtype='float32', always_2d=True)
             
-            logger.info(f"原始采样率: {orig_sample_rate}Hz, 数据长度: {len(data)}帧")
+            # 验证采样率匹配
+            if file_sample_rate != original_sample_rate:
+                logger.warning(f"文件采样率不匹配: 期望 {original_sample_rate}Hz, 实际 {file_sample_rate}Hz")
+                original_sample_rate = file_sample_rate
+            
+            logger.info(f"原始采样率: {original_sample_rate}Hz, 数据长度: {len(data)}帧")
             
             if progress_callback:
                 progress_callback(track_id, 0.5, "处理音频数据...")
             
-            # Apply speed adjustment (不进行重采样到引擎采样率)
+            # Apply speed adjustment (保持原始采样率)
             if abs(speed - 1.0) > 0.01:
                 logger.info(f"应用时间拉伸（倍数={speed:.2f}）")
-                # 使用原始采样率进行时间拉伸
-                data = self._time_stretch_unsampled(data, speed, orig_sample_rate)
+                data = self._time_stretch_unsampled(data, speed, original_sample_rate)
+            
+            # 应用噪音抑制和平滑处理
+            data = self._apply_noise_suppression(data, track_id)
             
             if progress_callback:
                 progress_callback(track_id, 0.8, "完成音频处理...")
             
             # Process audio data (保持原始采样率)
-            self._process_audio_data(track_id, data, auto_normalize, orig_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+            self._process_audio_data(track_id, data, auto_normalize, original_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
+            
+            # 添加噪音抑制状态
+            with self.lock:
+                if track_id in self.track_states:
+                    self.track_states[track_id]['unsampled_mode'] = True
+                    self.track_states[track_id]['noise_gate_threshold'] = 0.001
+                    self.track_states[track_id]['last_peak_level'] = 0.0
+                    self.track_states[track_id]['pop_filter_history'] = np.zeros((8, self.channels), dtype=np.float32)
             
             # Cache file path
             with self.lock:
                 self.track_files[track_id] = file_path
             
             if progress_callback:
-                progress_callback(track_id, 1.0, f"加载完成，保持原始采样率 {orig_sample_rate}Hz")
+                progress_callback(track_id, 1.0, f"加载完成，保持原始采样率 {original_sample_rate}Hz")
             
-            logger.info(f"轨道加载完成（保持原始采样率）: {track_id} ({len(data)}帧, {orig_sample_rate}Hz)")
+            logger.info(f"轨道加载完成（保持原始采样率）: {track_id} ({len(data)}帧, {original_sample_rate}Hz)")
             if on_complete:
                 on_complete(track_id, True)
                 
@@ -3549,6 +3869,214 @@ class AudioEngine:
             logger.error(f"文件加载失败（unsampled模式）: {str(e)}")
             if on_complete:
                 on_complete(track_id, False, str(e))
+
+    def _apply_noise_suppression(self, audio_data: npt.NDArray, track_id: str = None) -> npt.NDArray:
+        """
+        应用噪音抑制和平滑处理
+        
+        Args:
+            audio_data: 输入音频数据
+            track_id: 轨道ID（用于状态跟踪）
+            
+        Returns:
+            处理后的音频数据
+        """
+        if audio_data.shape[0] == 0:
+            return audio_data
+        
+        # 创建输出数组
+        processed_data = audio_data.copy()
+        
+        # 1. 直流偏移移除（消除电流声）
+        for channel in range(processed_data.shape[1]):
+            dc_offset = np.mean(processed_data[:, channel])
+            if abs(dc_offset) > 0.001:  # 如果有明显的直流偏移
+                processed_data[:, channel] -= dc_offset
+        
+        # 2. 高通滤波器（消除低频噪音和隆隆声）
+        processed_data = self._apply_highpass_filter(processed_data)
+        
+        # 3. 噪音门（抑制低电平噪音）
+        processed_data = self._apply_noise_gate(processed_data, threshold=0.001)
+        
+        # 4. 爆音检测和抑制
+        processed_data = self._suppress_pops_and_clicks(processed_data, track_id)
+        
+        # 5. 平滑处理（消除突然的跳跃）
+        processed_data = self._apply_smoothing_filter(processed_data)
+        
+        # 6. 限制器（防止削峰）
+        processed_data = self._apply_soft_limiter(processed_data, threshold=0.95)
+        
+        return processed_data
+    
+    def _apply_highpass_filter(self, audio_data: npt.NDArray, cutoff_freq: float = 20.0) -> npt.NDArray:
+        """
+        应用高通滤波器（移除低频噪音）
+        
+        Args:
+            audio_data: 输入音频数据
+            cutoff_freq: 截止频率（Hz）
+            
+        Returns:
+            滤波后的音频数据
+        """
+        try:
+            from scipy.signal import butter, filtfilt
+            # 设计高通滤波器
+            nyquist = self.sample_rate / 2
+            normal_cutoff = cutoff_freq / nyquist
+            b, a = butter(2, normal_cutoff, btype='high', analog=False)
+            
+            # 应用滤波器
+            filtered_data = np.zeros_like(audio_data)
+            for channel in range(audio_data.shape[1]):
+                filtered_data[:, channel] = filtfilt(b, a, audio_data[:, channel])
+            
+            return filtered_data
+        except ImportError:
+            # 如果没有scipy，使用简单的一阶高通滤波器
+            alpha = 0.95  # 滤波器系数
+            filtered_data = np.zeros_like(audio_data)
+            
+            for channel in range(audio_data.shape[1]):
+                prev_input = 0.0
+                prev_output = 0.0
+                
+                for i in range(audio_data.shape[0]):
+                    current_input = audio_data[i, channel]
+                    output = alpha * (prev_output + current_input - prev_input)
+                    filtered_data[i, channel] = output
+                    
+                    prev_input = current_input
+                    prev_output = output
+            
+            return filtered_data
+    
+    def _apply_noise_gate(self, audio_data: npt.NDArray, threshold: float = 0.001) -> npt.NDArray:
+        """
+        应用噪音门（抑制低电平信号）
+        
+        Args:
+            audio_data: 输入音频数据
+            threshold: 噪音门阈值
+            
+        Returns:
+            处理后的音频数据
+        """
+        # 计算每个样本的RMS电平
+        window_size = min(64, audio_data.shape[0])
+        processed_data = audio_data.copy()
+        
+        for i in range(audio_data.shape[0]):
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(audio_data.shape[0], i + window_size // 2)
+            
+            # 计算窗口内的RMS
+            window_data = audio_data[start_idx:end_idx]
+            rms = np.sqrt(np.mean(window_data ** 2))
+            
+            # 如果低于阈值，应用渐进衰减
+            if rms < threshold:
+                fade_factor = rms / threshold  # 0到1之间的渐进因子
+                processed_data[i] *= fade_factor
+        
+        return processed_data
+    
+    def _suppress_pops_and_clicks(self, audio_data: npt.NDArray, track_id: str = None) -> npt.NDArray:
+        """
+        检测和抑制爆音、咔嗒声
+        
+        Args:
+            audio_data: 输入音频数据
+            track_id: 轨道ID
+            
+        Returns:
+            处理后的音频数据
+        """
+        processed_data = audio_data.copy()
+        
+        # 检测突然的幅度变化
+        for channel in range(processed_data.shape[1]):
+            channel_data = processed_data[:, channel]
+            
+            # 计算一阶差分（检测突然变化）
+            if len(channel_data) > 1:
+                diff = np.diff(channel_data)
+                
+                # 检测异常大的跳跃
+                threshold = np.std(diff) * 3.0  # 3倍标准差
+                outlier_indices = np.where(np.abs(diff) > threshold)[0]
+                
+                # 平滑异常点
+                for idx in outlier_indices:
+                    if idx > 0 and idx < len(channel_data) - 1:
+                        # 使用相邻样本的平均值替代
+                        smoothed_value = (channel_data[idx-1] + channel_data[idx+1]) / 2
+                        # 渐进混合而不是直接替换
+                        blend_factor = 0.7
+                        processed_data[idx, channel] = (
+                            blend_factor * smoothed_value + 
+                            (1 - blend_factor) * channel_data[idx]
+                        )
+        
+        return processed_data
+    
+    def _apply_smoothing_filter(self, audio_data: npt.NDArray) -> npt.NDArray:
+        """
+        应用平滑滤波器（移除尖锐的边缘）
+        
+        Args:
+            audio_data: 输入音频数据
+            
+        Returns:
+            平滑后的音频数据
+        """
+        # 使用简单的移动平均滤波器
+        window_size = 3  # 小窗口以保持音质
+        processed_data = audio_data.copy()
+        
+        if audio_data.shape[0] >= window_size:
+            for channel in range(audio_data.shape[1]):
+                # 应用移动平均
+                for i in range(1, audio_data.shape[0] - 1):
+                    window_start = max(0, i - window_size // 2)
+                    window_end = min(audio_data.shape[0], i + window_size // 2 + 1)
+                    
+                    window_data = audio_data[window_start:window_end, channel]
+                    smoothed_value = np.mean(window_data)
+                    
+                    # 轻微混合以保持原始特性
+                    mix_factor = 0.3  # 30%平滑，70%原始
+                    processed_data[i, channel] = (
+                        mix_factor * smoothed_value + 
+                        (1 - mix_factor) * audio_data[i, channel]
+                    )
+        
+        return processed_data
+    
+    def _apply_soft_limiter(self, audio_data: npt.NDArray, threshold: float = 0.95) -> npt.NDArray:
+        """
+        应用软限制器（防止削峰失真）
+        
+        Args:
+            audio_data: 输入音频数据
+            threshold: 限制阈值
+            
+        Returns:
+            限制后的音频数据
+        """
+        processed_data = audio_data.copy()
+        
+        # 应用软限制
+        mask = np.abs(processed_data) > threshold
+        
+        # 使用tanh函数进行软限制
+        processed_data[mask] = np.sign(processed_data[mask]) * threshold * np.tanh(
+            np.abs(processed_data[mask]) / threshold
+        )
+        
+        return processed_data
 
     def _time_stretch_unsampled(self, data: npt.NDArray, speed: float, sample_rate: int) -> npt.NDArray:
         """
@@ -3600,4 +4128,77 @@ class AudioEngine:
             resampled[:, channel] = np.interp(target_times, orig_times, data[:, channel])
         
         return resampled
+
+    def force_streaming_mode_unsampled(self, track_id: str, file_path: str, 
+                                     auto_normalize: bool = True,
+                                     silent_lpadding_ms: float = 0.0,
+                                     silent_rpadding_ms: float = 0.0,
+                                     on_complete: Optional[Callable] = None,
+                                     progress_callback: Optional[Callable] = None) -> bool:
+        """
+        强制使用流式模式加载轨道（保持原始采样率，忽略文件大小阈值）
+        
+        无论文件大小如何，都强制使用流式播放模式加载轨道，并保持原始采样率。
+        
+        Args:
+            track_id (str): 轨道ID
+            file_path (str): 音频文件路径
+            auto_normalize (bool, optional): 是否自动标准化. Defaults to True.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
+            on_complete (callable, optional): 完成回调. Defaults to None.
+            progress_callback (callable, optional): 进度回调. Defaults to None.
+            
+        Returns:
+            bool: 是否开始加载
+            
+        Example:
+            >>> # 强制使用流式模式加载小文件（保持原始采样率）
+            >>> success = engine.force_streaming_mode_unsampled(
+            ...     track_id="hq_audio",
+            ...     file_path="/path/to/audio.wav",
+            ...     silent_lpadding_ms=300.0,  # 前面300ms静音
+            ...     silent_rpadding_ms=500.0  # 后面500ms静音
+            ... )
+            >>> if success:
+            ...     print("强制流式加载已开始（保持原始采样率）")
+        """
+        if not os.path.isfile(file_path):
+            error = f"文件不存在: {file_path}"
+            logger.error(error)
+            if on_complete:
+                on_complete(track_id, False, error)
+            return False
+        
+        # 检查轨道数量限制
+        with self.lock:
+            if len(self.track_states) >= self.max_tracks:
+                error = f"轨道数量已达上限 ({self.max_tracks})"
+                logger.warning(error)
+                if on_complete:
+                    on_complete(track_id, False, error)
+                return False
+            
+            # 如果轨道已存在，先卸载
+            if track_id in self.track_states:
+                self.unload_track(track_id)
+        
+        # 获取文件的原始采样率
+        try:
+            with sf.SoundFile(file_path) as f:
+                original_sample_rate = f.samplerate
+            
+            logger.info(f"强制流式加载（保持原始采样率 {original_sample_rate}Hz）: {file_path}")
+            
+            # 强制使用流式加载（保持原始采样率）
+            self._load_streaming_track_unsampled(track_id, file_path, auto_normalize, 
+                                               original_sample_rate, silent_lpadding_ms, silent_rpadding_ms, 
+                                               on_complete, progress_callback)
+            return True
+            
+        except Exception as e:
+            logger.error(f"强制流式加载失败（unsampled模式）: {e}")
+            if on_complete:
+                on_complete(track_id, False, str(e))
+            return False
 
