@@ -36,6 +36,7 @@ class StreamingTrackData:
         seek_requested (tuple): 跳转请求
         buffer_underruns (int): 缓冲区下溢次数
         chunks_loaded (int): 已加载的块数
+        _last_sample (np.ndarray): 用于平滑过渡的音频样本
     """
     
     def __init__(self, track_id: str, file_path: str, engine_sample_rate: int = 48000, 
@@ -92,6 +93,9 @@ class StreamingTrackData:
         # 性能统计
         self.buffer_underruns = 0
         self.chunks_loaded = 0
+        
+        # 初始化音频平滑相关状态
+        self._last_sample = np.zeros((1, engine_channels), dtype=np.float32)
         
         self._initialize_file()
     
@@ -375,14 +379,12 @@ class StreamingTrackData:
             这个方法是线程安全的，会自动管理缓冲区访问
         """
         with self.buffer_lock:
-            if not self.audio_buffer:
-                if not self.eof_reached:
-                    self.buffer_underruns += 1
-                return np.zeros((frames_needed, self.engine_channels), dtype=np.float32)
-            
             # 从缓冲区收集数据
             output = np.zeros((frames_needed, self.engine_channels), dtype=np.float32)
             frames_filled = 0
+            
+            # 记录上一次的音频样本，用于平滑过渡
+            last_sample = getattr(self, '_last_sample', np.zeros((1, self.engine_channels), dtype=np.float32))
             
             while frames_filled < frames_needed and self.audio_buffer:
                 chunk = self.audio_buffer[0]
@@ -393,13 +395,50 @@ class StreamingTrackData:
                     # 使用整个块
                     output[frames_filled:frames_filled + available_frames] = chunk
                     frames_filled += available_frames
+                    
+                    # 保存最后的样本
+                    if chunk.shape[0] > 0:
+                        last_sample = chunk[-1:]
+                    
                     self.audio_buffer.popleft()
                 else:
                     # 使用块的一部分
                     output[frames_filled:frames_filled + needed_frames] = chunk[:needed_frames]
+                    
+                    # 保存最后的样本
+                    if needed_frames > 0:
+                        last_sample = chunk[needed_frames-1:needed_frames]
+                    
                     # 更新剩余的块
                     self.audio_buffer[0] = chunk[needed_frames:]
                     frames_filled += needed_frames
+            
+            # 如果缓冲区数据不足，进行平滑填充
+            if frames_filled < frames_needed:
+                if not self.eof_reached:
+                    self.buffer_underruns += 1
+                
+                remaining_frames = frames_needed - frames_filled
+                
+                # 如果有之前的样本，使用淡出填充而不是直接零填充
+                if frames_filled > 0 or hasattr(self, '_last_sample'):
+                    fade_length = min(remaining_frames, 64)  # 最多64样本的淡出
+                    
+                    if fade_length > 0:
+                        # 创建淡出序列
+                        fade_out = np.linspace(1.0, 0.0, fade_length)[:, np.newaxis]
+                        fade_chunk = last_sample * fade_out
+                        
+                        # 应用淡出
+                        output[frames_filled:frames_filled + fade_length] = fade_chunk
+                        frames_filled += fade_length
+                    
+                    # 剩余部分填充零（已经是零了）
+                # 如果这是第一次或没有历史数据，直接零填充（output已经初始化为零）
+            
+            # 保存最后的样本用于下次调用
+            if frames_filled > 0:
+                self._last_sample = output[-1:]
             
             # 更新播放位置
             self.playback_position += frames_filled

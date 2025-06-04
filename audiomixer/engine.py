@@ -95,6 +95,10 @@ class AudioEngine:
         self.lock: threading.RLock = threading.RLock()
         self.loading_queue: queue.Queue = queue.Queue(maxsize=5)  # Loading queue to prevent too many simultaneous loads
         
+        # 内置定时器系统
+        self.scheduled_tasks: Dict[str, threading.Timer] = {}  # 定时任务管理
+        self.task_lock: threading.Lock = threading.Lock()  # 任务锁
+        
         # Performance monitoring
         self.peak_level: float = 0.0
         self.cpu_usage: float = 0.0  # Using exponential weighted moving average
@@ -181,14 +185,14 @@ class AudioEngine:
                 if task is None:  # Stop signal
                     break
                     
-                track_id, source, speed, auto_normalize, sample_rate, silent_padding_ms, on_complete, progress_callback = task
+                track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback = task
                 
                 if isinstance(source, str):
                     # File path
-                    self._load_track_from_file_optimized(track_id, source, speed, auto_normalize, sample_rate, silent_padding_ms, on_complete, progress_callback)
+                    self._load_track_from_file_optimized(track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
                 else:
                     # NumPy array
-                    self._process_audio_data(track_id, source, auto_normalize, sample_rate, silent_padding_ms)
+                    self._process_audio_data(track_id, source, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms)
                     if on_complete:
                         on_complete(track_id, True)
                 
@@ -200,7 +204,7 @@ class AudioEngine:
 
     def _load_track_from_file_optimized(self, track_id: str, file_path: str, speed: float,
                                       auto_normalize: bool, sample_rate: Optional[int],
-                                      silent_padding_ms: float,
+                                      silent_lpadding_ms: float, silent_rpadding_ms: float,
                                       on_complete: Optional[Callable], 
                                       progress_callback: Optional[Callable]) -> None:
         """
@@ -217,7 +221,8 @@ class AudioEngine:
             speed (float): 播放速度倍数
             auto_normalize (bool): 是否自动音量标准化
             sample_rate (int, optional): 目标采样率
-            silent_padding_ms (float, optional): 前后静音填充时长（毫秒）. Defaults to 0.0.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
             on_complete (callable, optional): 完成回调函数
             progress_callback (callable, optional): 进度回调函数
                 格式：progress_callback(track_id, progress: 0.0-1.0, message)
@@ -249,16 +254,16 @@ class AudioEngine:
             if use_streaming:
                 logger.info(f"使用流式播放模式: {file_size/(1024*1024):.1f}MB")
                 self._load_streaming_track(track_id, file_path, auto_normalize, 
-                                         sample_rate, silent_padding_ms, on_complete, progress_callback)
+                                         sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
             elif file_size > self.large_file_threshold:
                 logger.info(f"使用大文件分块加载模式: {file_size/(1024*1024):.1f}MB")
                 self._load_large_file_streaming(track_id, file_path, speed, auto_normalize, 
-                                              sample_rate, silent_padding_ms, on_complete, progress_callback)
+                                              sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
             else:
                 logger.info(f"使用标准预加载模式: {file_size/(1024*1024):.1f}MB")
                 # 小文件使用原有方法
                 self._load_track_from_file(track_id, file_path, speed, auto_normalize, 
-                                         sample_rate, silent_padding_ms, on_complete)
+                                         sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete)
                 
         except Exception as e:
             logger.error(f"文件加载失败: {str(e)}")
@@ -266,7 +271,7 @@ class AudioEngine:
                 on_complete(track_id, False, str(e))
 
     def _load_streaming_track(self, track_id: str, file_path: str, auto_normalize: bool,
-                            sample_rate: Optional[int], silent_padding_ms: float,
+                            sample_rate: Optional[int], silent_lpadding_ms: float, silent_rpadding_ms: float,
                             on_complete: Optional[Callable], 
                             progress_callback: Optional[Callable]) -> None:
         """
@@ -280,7 +285,8 @@ class AudioEngine:
             file_path (str): 音频文件路径
             auto_normalize (bool): 是否自动音量标准化
             sample_rate (int, optional): 目标采样率
-            silent_padding_ms (float, optional): 前后静音填充时长（毫秒）. Defaults to 0.0.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
             on_complete (callable, optional): 完成回调函数
             progress_callback (callable, optional): 进度回调函数
         """
@@ -324,9 +330,11 @@ class AudioEngine:
                     'resample_buffer': None,
                     'streaming_mode': True,  # 标记为流式模式
                     'auto_normalize': auto_normalize,
-                    'silent_padding_ms': silent_padding_ms,  # 静音填充信息
-                    'padding_frames_start': int((silent_padding_ms / 1000.0) * target_sample_rate) if silent_padding_ms > 0 else 0,  # 开始静音帧数
-                    'padding_frames_end': int((silent_padding_ms / 1000.0) * target_sample_rate) if silent_padding_ms > 0 else 0,  # 结束静音帧数
+                    'silent_padding_ms': silent_lpadding_ms + silent_rpadding_ms,  # 静音填充信息（兼容性）
+                    'silent_lpadding_ms': silent_lpadding_ms,  # 左侧静音填充信息
+                    'silent_rpadding_ms': silent_rpadding_ms,  # 右侧静音填充信息
+                    'padding_frames_start': int((silent_lpadding_ms / 1000.0) * target_sample_rate) if silent_lpadding_ms > 0 else 0,  # 开始静音帧数
+                    'padding_frames_end': int((silent_rpadding_ms / 1000.0) * target_sample_rate) if silent_rpadding_ms > 0 else 0,  # 结束静音帧数
                     'virtual_position': 0,  # 虚拟播放位置（包含静音填充）
                 }
                 
@@ -352,7 +360,7 @@ class AudioEngine:
 
     def _load_large_file_streaming(self, track_id: str, file_path: str, speed: float,
                                  auto_normalize: bool, sample_rate: Optional[int],
-                                 silent_padding_ms: float,
+                                 silent_lpadding_ms: float, silent_rpadding_ms: float,
                                  on_complete: Optional[Callable], 
                                  progress_callback: Optional[Callable]) -> None:
         """
@@ -437,7 +445,7 @@ class AudioEngine:
                     final_data = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
                     
                     # 最终处理
-                    self._process_audio_data(track_id, final_data, auto_normalize, target_sample_rate, silent_padding_ms)
+                    self._process_audio_data(track_id, final_data, auto_normalize, target_sample_rate, silent_lpadding_ms, silent_rpadding_ms)
                     
                     # 缓存文件路径
                     with self.lock:
@@ -459,7 +467,7 @@ class AudioEngine:
 
     def _load_track_from_file(self, track_id: str, file_path: str, speed: float,
                             auto_normalize: bool, sample_rate: Optional[int],
-                            silent_padding_ms: float,
+                            silent_lpadding_ms: float, silent_rpadding_ms: float,
                             on_complete: Optional[Callable]) -> None:
         """Load track from file (internal method)"""
         try:
@@ -479,7 +487,7 @@ class AudioEngine:
                 data = self._time_stretch(data, speed)
             
             # Process audio data
-            self._process_audio_data(track_id, data, auto_normalize, sample_rate, silent_padding_ms)
+            self._process_audio_data(track_id, data, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms)
             
             # Cache file path
             with self.lock:
@@ -611,14 +619,15 @@ class AudioEngine:
 
     def _process_audio_data(self, track_id: str, audio_data: npt.NDArray, 
                            auto_normalize: bool, track_sample_rate: Optional[int] = None,
-                           silent_padding_ms: float = 0.0) -> None:
+                           silent_lpadding_ms: float = 0.0, silent_rpadding_ms: float = 0.0) -> None:
         """
         Process audio data (internal method)
         :param track_id: Track ID
         :param audio_data: Audio data
         :param auto_normalize: Whether to auto-normalize volume
         :param track_sample_rate: Track's specific sample rate (None to use engine's default)
-        :param silent_padding_ms: Silent padding duration in milliseconds (added before and after audio)
+        :param silent_lpadding_ms: Silent padding duration in milliseconds (added before audio)
+        :param silent_rpadding_ms: Silent padding duration in milliseconds (added after audio)
         """
         # 确定音轨的采样率
         if track_sample_rate is None:
@@ -636,17 +645,32 @@ class AudioEngine:
                 raise ValueError(f"Unsupported channel conversion: {audio_data.shape[1]} -> {self.channels}")
         
         # 添加静音填充
-        if silent_padding_ms > 0.0:
-            # 计算静音填充的帧数
-            padding_frames = int((silent_padding_ms / 1000.0) * track_sample_rate)
-            if padding_frames > 0:
-                # 创建静音数据
-                silence = np.zeros((padding_frames, self.channels), dtype=np.float32)
+        if silent_lpadding_ms > 0.0 or silent_rpadding_ms > 0.0:
+            # 分别计算左右静音填充的帧数
+            lpadding_frames = int((silent_lpadding_ms / 1000.0) * track_sample_rate) if silent_lpadding_ms > 0 else 0
+            rpadding_frames = int((silent_rpadding_ms / 1000.0) * track_sample_rate) if silent_rpadding_ms > 0 else 0
+            
+            if lpadding_frames > 0 or rpadding_frames > 0:
+                # 创建左右静音数据
+                parts = []
                 
-                # 在前后添加静音
-                audio_data = np.concatenate([silence, audio_data, silence], axis=0)
+                # 添加左侧静音
+                if lpadding_frames > 0:
+                    left_silence = np.zeros((lpadding_frames, self.channels), dtype=np.float32)
+                    parts.append(left_silence)
                 
-                logger.info(f"添加静音填充: {track_id} ({silent_padding_ms}ms = {padding_frames}帧)")
+                # 添加原音频
+                parts.append(audio_data)
+                
+                # 添加右侧静音
+                if rpadding_frames > 0:
+                    right_silence = np.zeros((rpadding_frames, self.channels), dtype=np.float32)
+                    parts.append(right_silence)
+                
+                # 合并所有部分
+                audio_data = np.concatenate(parts, axis=0)
+                
+                logger.info(f"添加静音填充: {track_id} (左: {silent_lpadding_ms}ms = {lpadding_frames}帧, 右: {silent_rpadding_ms}ms = {rpadding_frames}帧)")
         
         # Auto volume normalization
         if auto_normalize:
@@ -676,15 +700,18 @@ class AudioEngine:
                 'resample_phase': 0.0,  # For real-time speed adjustment
                 'sample_rate': track_sample_rate,  # Track's specific sample rate
                 'resample_buffer': None,  # Buffer for sample rate conversion
-                'silent_padding_ms': silent_padding_ms,  # 保存静音填充信息
+                'silent_padding_ms': silent_lpadding_ms + silent_rpadding_ms,  # 保存静音填充信息（兼容性）
+                'silent_lpadding_ms': silent_lpadding_ms,  # 左侧静音填充信息
+                'silent_rpadding_ms': silent_rpadding_ms,  # 右侧静音填充信息
             }
         
-        logger.info(f"Track loaded from data: {track_id} ({len(audio_data)} samples, {track_sample_rate}Hz, padding: {silent_padding_ms}ms)")
+        logger.info(f"Track loaded from data: {track_id} ({len(audio_data)} samples, {track_sample_rate}Hz, padding: {silent_lpadding_ms}ms + {silent_rpadding_ms}ms)")
 
     def load_track(self, track_id: str, source: Union[npt.NDArray, str], 
                   speed: float = 1.0, auto_normalize: bool = True, 
                   sample_rate: Optional[int] = None,
-                  silent_padding_ms: float = 0.0,
+                  silent_lpadding_ms: float = 0.0,
+                  silent_rpadding_ms: float = 0.0,
                   on_complete: Optional[Callable] = None,
                   progress_callback: Optional[Callable] = None) -> bool:
         """
@@ -699,7 +726,8 @@ class AudioEngine:
             speed (float, optional): 播放速度倍数（0.1-4.0）. Defaults to 1.0.
             auto_normalize (bool, optional): 是否自动音量标准化. Defaults to True.
             sample_rate (int, optional): 轨道采样率，None使用引擎默认值. Defaults to None.
-            silent_padding_ms (float, optional): 前后静音填充时长（毫秒）. Defaults to 0.0.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
             on_complete (callable, optional): 加载完成回调函数. Defaults to None.
                 格式：on_complete(track_id, success, error=None)
             progress_callback (callable, optional): 进度回调函数. Defaults to None.
@@ -726,7 +754,8 @@ class AudioEngine:
             ...     source="/path/to/music.wav",
             ...     speed=1.0,
             ...     auto_normalize=True,
-            ...     silent_padding_ms=500.0,  # 前后各500ms静音
+            ...     silent_lpadding_ms=300.0,  # 前面300ms静音
+            ...     silent_rpadding_ms=500.0,  # 后面500ms静音
             ...     on_complete=on_load_complete,
             ...     progress_callback=on_progress
             ... )
@@ -735,7 +764,8 @@ class AudioEngine:
         speed = max(0.1, min(4.0, speed))
         
         # Validate silent padding
-        silent_padding_ms = max(0.0, silent_padding_ms)
+        silent_lpadding_ms = max(0.0, silent_lpadding_ms)
+        silent_rpadding_ms = max(0.0, silent_rpadding_ms)
         
         # Validate sample rate
         if sample_rate is not None:
@@ -761,11 +791,11 @@ class AudioEngine:
         # Handle different source types
         if isinstance(source, np.ndarray):
             # Add to loading queue (background processing)
-            self.loading_queue.put((track_id, source, speed, auto_normalize, sample_rate, silent_padding_ms, on_complete, progress_callback))
+            self.loading_queue.put((track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback))
             return True
         elif isinstance(source, str) and os.path.isfile(source):
             # Add to loading queue
-            self.loading_queue.put((track_id, source, speed, auto_normalize, sample_rate, silent_padding_ms, on_complete, progress_callback))
+            self.loading_queue.put((track_id, source, speed, auto_normalize, sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback))
             return True
         else:
             error = f"Unsupported source type: {type(source)}"
@@ -926,17 +956,23 @@ class AudioEngine:
             logger.info(f"Set speed for {track_id}: {speed:.2f}")
             return True
     
-    def stop(self, track_id: str, fade_out: bool = True) -> None:
+    def stop(self, track_id: str, fade_out: bool = True, delay_sec: float = 0.0, fade_duration: float = None) -> None:
         """
         停止轨道播放
         
-        停止指定轨道的播放。可以选择是否使用淡出效果。
+        停止指定轨道的播放。可以选择是否使用淡出效果，支持延迟停止和自定义淡出时长。
         
         Args:
             track_id (str): 要停止的轨道ID
             fade_out (bool, optional): 是否使用淡出效果. Defaults to True.
                 - True: 平滑淡出后停止
                 - False: 立即停止
+            delay_sec (float, optional): 延迟停止时间（秒）. Defaults to 0.0.
+                - 0.0: 立即开始停止操作
+                - >0.0: 延迟指定时间后开始停止操作
+            fade_duration (float, optional): 淡出持续时间（秒）. Defaults to None.
+                - None: 使用轨道的默认淡出时长
+                - >0.0: 使用指定的淡出时长
                 
         Note:
             停止后轨道位置会重置到开头
@@ -947,6 +983,65 @@ class AudioEngine:
             
             >>> # 立即停止
             >>> engine.stop("bgm1", fade_out=False)
+            
+            >>> # 15秒后开始淡出停止
+            >>> engine.stop("bgm1", delay_sec=15.0)
+            
+            >>> # 5秒后开始，用2秒淡出停止
+            >>> engine.stop("bgm1", delay_sec=5.0, fade_duration=2.0)
+        """
+        # 如果有延迟，使用内置定时器
+        if delay_sec > 0.0:
+            self._schedule_delayed_stop(track_id, fade_out, fade_duration, delay_sec)
+            return
+        
+        # 立即停止
+        self._stop_immediate(track_id, fade_out, fade_duration)
+    
+    def _schedule_delayed_stop(self, track_id: str, fade_out: bool, fade_duration: float, delay_sec: float) -> None:
+        """
+        安排延迟停止任务
+        
+        Args:
+            track_id (str): 轨道ID
+            fade_out (bool): 是否淡出
+            fade_duration (float): 淡出时长
+            delay_sec (float): 延迟时间
+        """
+        # 取消该轨道之前的定时任务
+        self.cancel_scheduled_task(track_id, "stop")
+        
+        def delayed_stop():
+            try:
+                self._stop_immediate(track_id, fade_out, fade_duration)
+            except Exception as e:
+                logger.error(f"延迟停止任务执行失败 {track_id}: {e}")
+            finally:
+                # 清理任务记录
+                task_key = f"{track_id}_stop"
+                with self.task_lock:
+                    self.scheduled_tasks.pop(task_key, None)
+        
+        # 创建定时器
+        task_key = f"{track_id}_stop"
+        timer = threading.Timer(delay_sec, delayed_stop)
+        
+        # 记录任务
+        with self.task_lock:
+            self.scheduled_tasks[task_key] = timer
+        
+        # 启动定时器
+        timer.start()
+        logger.debug(f"已安排轨道 {track_id} 在 {delay_sec} 秒后停止")
+    
+    def _stop_immediate(self, track_id: str, fade_out: bool, fade_duration: float = None) -> None:
+        """
+        立即执行停止操作
+        
+        Args:
+            track_id (str): 轨道ID
+            fade_out (bool): 是否淡出
+            fade_duration (float): 淡出时长
         """
         with self.lock:
             if track_id not in self.track_states:
@@ -957,10 +1052,15 @@ class AudioEngine:
             if not state.get('playing', False):
                 return
             
+            # 设置自定义淡出时长
+            if fade_duration is not None and fade_duration > 0.0:
+                state['fade_duration'] = fade_duration
+            
             if fade_out and state.get('fade_direction') is None:
                 # Start fade-out
                 state['fade_progress'] = 1.0
                 state['fade_direction'] = 'out'
+                logger.debug(f"开始淡出停止轨道: {track_id}, 淡出时长: {state.get('fade_duration', 0.05)}秒")
             elif not fade_out:
                 # Stop immediately
                 state['playing'] = False
@@ -971,7 +1071,60 @@ class AudioEngine:
                 state['fade_direction'] = None
                 state['resample_phase'] = 0.0  # Reset resample state
                 
-                logger.debug(f"Stopped track: {track_id}")
+                logger.debug(f"立即停止轨道: {track_id}")
+    
+    def cancel_scheduled_task(self, track_id: str, task_type: str = "stop") -> bool:
+        """
+        取消指定轨道的定时任务
+        
+        Args:
+            track_id (str): 轨道ID
+            task_type (str): 任务类型，默认"stop"
+            
+        Returns:
+            bool: 是否成功取消任务
+        """
+        task_key = f"{track_id}_{task_type}"
+        with self.task_lock:
+            timer = self.scheduled_tasks.pop(task_key, None)
+            if timer:
+                timer.cancel()
+                logger.debug(f"已取消轨道 {track_id} 的 {task_type} 定时任务")
+                return True
+            return False
+    
+    def cancel_all_scheduled_tasks(self) -> int:
+        """
+        取消所有定时任务
+        
+        Returns:
+            int: 取消的任务数量
+        """
+        with self.task_lock:
+            count = 0
+            for timer in self.scheduled_tasks.values():
+                timer.cancel()
+                count += 1
+            self.scheduled_tasks.clear()
+            logger.debug(f"已取消所有定时任务，共 {count} 个")
+            return count
+    
+    def get_scheduled_tasks(self) -> Dict[str, float]:
+        """
+        获取所有定时任务的剩余时间
+        
+        Returns:
+            Dict[str, float]: 任务键和剩余时间的字典
+        """
+        result = {}
+        with self.task_lock:
+            current_time = time.time()
+            for task_key, timer in self.scheduled_tasks.items():
+                if timer.is_alive():
+                    # 计算剩余时间（近似值）
+                    remaining = getattr(timer, 'interval', 0) - (current_time - getattr(timer, '_start_time', current_time))
+                    result[task_key] = max(0.0, remaining)
+        return result
     
     def pause(self, track_id: str) -> None:
         """
@@ -1645,6 +1798,9 @@ class AudioEngine:
         """
         if self.is_running:
             try:
+                # 取消所有定时任务
+                self.cancel_all_scheduled_tasks()
+                
                 # Stop all tracks
                 with self.lock:
                     for track_id in list(self.active_tracks):
@@ -1753,16 +1909,35 @@ class AudioEngine:
                         state['position'] = new_position
                     
                     if chunk is not None and chunk.shape[0] > 0:
+                        # 检测并平滑音频不连续性，预防爆音
+                        chunk = self._detect_and_smooth_discontinuities(chunk, track_id)
+                        
                         # Apply audio effects
                         self._apply_audio_effects_optimized(chunk, state, frames)
                         
-                        # Mix to main buffer
+                        # 改进的混合逻辑 - 处理长度不匹配并进行平滑
                         if chunk.shape[0] == frames:
                             mix_buffer += chunk
+                        elif chunk.shape[0] < frames:
+                            # 输入数据不足，需要填充
+                            min_frames = chunk.shape[0]
+                            mix_buffer[:min_frames] += chunk
+                            
+                            # 使用最后几个样本进行淡出填充，避免突然跳跃
+                            if min_frames > 0 and min_frames < frames:
+                                fade_length = min(32, frames - min_frames)  # 最多32样本的淡出
+                                last_sample = chunk[-1:] if chunk.shape[0] > 0 else np.zeros((1, self.channels), dtype=np.float32)
+                                
+                                # 创建淡出序列
+                                fade_out = np.linspace(1.0, 0.0, fade_length)[:, np.newaxis]
+                                fade_chunk = last_sample * fade_out
+                                
+                                end_pos = min(min_frames + fade_length, frames)
+                                actual_fade_length = end_pos - min_frames
+                                mix_buffer[min_frames:end_pos] += fade_chunk[:actual_fade_length]
                         else:
-                            # Handle length mismatch
-                            min_frames = min(chunk.shape[0], frames)
-                            mix_buffer[:min_frames] += chunk[:min_frames]
+                            # 输入数据过多，截取并淡出
+                            mix_buffer += chunk[:frames]
                         
                         # Update peak level
                         chunk_peak = np.max(np.abs(chunk))
@@ -2003,7 +2178,7 @@ class AudioEngine:
             else:
                 # 简单的线性插值重采样
                 orig_times = np.arange(chunk.shape[0])
-                target_times = np.linspace(0, chunk.shape[0]-1, target_frames)
+                target_times = np.linspace(0, max(chunk.shape[0]-1, 0), target_frames)
                 resampled = np.zeros((target_frames, self.channels), dtype=np.float32)
                 for channel in range(self.channels):
                     resampled[:, channel] = np.interp(target_times, orig_times, chunk[:, channel])
@@ -2028,10 +2203,14 @@ class AudioEngine:
                     resampled[:, channel] = np.interp(target_times, orig_times, chunk[:, channel])
                 return resampled
             else:
-                # 如果源数据太少，用重复或零填充
+                # 如果源数据只有一个样本，创建平滑的淡出而不是重复
                 resampled = np.zeros((target_frames, self.channels), dtype=np.float32)
                 if chunk.shape[0] > 0:
-                    resampled[:] = chunk[0]  # 重复第一个样本
+                    # 创建指数衰减而不是直接重复，避免锐鸣声
+                    fade_length = min(target_frames, 32)  # 最多32样本的衰减
+                    fade_out = np.exp(-np.arange(fade_length) * 0.1)  # 指数衰减
+                    for channel in range(self.channels):
+                        resampled[:fade_length, channel] = chunk[0, channel] * fade_out
                 return resampled
     
     def _extract_audio_chunk_with_speed(self, audio_data: npt.NDArray, position: int, 
@@ -2226,7 +2405,9 @@ class AudioEngine:
                     'sample_rate_ratio': state['sample_rate'] / self.sample_rate,
                     'streaming_mode': True,
                     'buffer_status': buffer_status,
-                    'silent_padding_ms': state.get('silent_padding_ms', 0.0),  # 静音填充信息
+                    'silent_padding_ms': state.get('silent_padding_ms', 0.0),  # 静音填充信息（兼容性）
+                    'silent_lpadding_ms': state.get('silent_lpadding_ms', 0.0),  # 左侧静音填充信息
+                    'silent_rpadding_ms': state.get('silent_rpadding_ms', 0.0),  # 右侧静音填充信息
                     'virtual_position': state.get('virtual_position', 0),  # 虚拟播放位置
                     'padding_frames_start': state.get('padding_frames_start', 0),  # 开始静音帧数
                     'padding_frames_end': state.get('padding_frames_end', 0),  # 结束静音帧数
@@ -2256,7 +2437,9 @@ class AudioEngine:
                     'engine_sample_rate': self.sample_rate,
                     'sample_rate_ratio': state['sample_rate'] / self.sample_rate,
                     'streaming_mode': False,
-                    'silent_padding_ms': state.get('silent_padding_ms', 0.0),  # 静音填充信息
+                    'silent_padding_ms': state.get('silent_padding_ms', 0.0),  # 静音填充信息（兼容性）
+                    'silent_lpadding_ms': state.get('silent_lpadding_ms', 0.0),  # 左侧静音填充信息
+                    'silent_rpadding_ms': state.get('silent_rpadding_ms', 0.0),  # 右侧静音填充信息
                 }
             
             return None
@@ -2889,7 +3072,8 @@ class AudioEngine:
     def force_streaming_mode(self, track_id: str, file_path: str, 
                            auto_normalize: bool = True, 
                            sample_rate: Optional[int] = None,
-                           silent_padding_ms: float = 0.0,
+                           silent_lpadding_ms: float = 0.0,
+                           silent_rpadding_ms: float = 0.0,
                            on_complete: Optional[Callable] = None,
                            progress_callback: Optional[Callable] = None) -> bool:
         """
@@ -2902,7 +3086,8 @@ class AudioEngine:
             file_path (str): 音频文件路径
             auto_normalize (bool, optional): 是否自动标准化. Defaults to True.
             sample_rate (int, optional): 采样率. Defaults to None.
-            silent_padding_ms (float, optional): 前后静音填充时长（毫秒）. Defaults to 0.0.
+            silent_lpadding_ms (float, optional): 音频前面的静音填充时长（毫秒）. Defaults to 0.0.
+            silent_rpadding_ms (float, optional): 音频后面的静音填充时长（毫秒）. Defaults to 0.0.
             on_complete (callable, optional): 完成回调. Defaults to None.
             progress_callback (callable, optional): 进度回调. Defaults to None.
             
@@ -2914,7 +3099,8 @@ class AudioEngine:
             >>> success = engine.force_streaming_mode(
             ...     track_id="bgm1",
             ...     file_path="/path/to/small_audio.wav",
-            ...     silent_padding_ms=300.0
+            ...     silent_lpadding_ms=300.0,  # 前面300ms静音
+            ...     silent_rpadding_ms=500.0  # 后面500ms静音
             ... )
             >>> if success:
             ...     print("强制流式加载已开始")
@@ -2942,7 +3128,7 @@ class AudioEngine:
         # 强制使用流式加载
         try:
             self._load_streaming_track(track_id, file_path, auto_normalize, 
-                                     sample_rate, silent_padding_ms, on_complete, progress_callback)
+                                     sample_rate, silent_lpadding_ms, silent_rpadding_ms, on_complete, progress_callback)
             return True
         except Exception as e:
             logger.error(f"强制流式加载失败: {e}")
@@ -3050,4 +3236,128 @@ class AudioEngine:
         """重置流式轨道用于循环播放"""
         streaming_track.seek_to(0.0)
         state['virtual_position'] = 0
+
+    def _detect_and_smooth_discontinuities(self, chunk: npt.NDArray, track_id: str) -> npt.NDArray:
+        """
+        检测并平滑音频不连续性，预防爆音和锐鸣声
+        
+        Args:
+            chunk (np.ndarray): 音频数据块
+            track_id (str): 轨道ID（用于状态跟踪）
+            
+        Returns:
+            np.ndarray: 平滑处理后的音频数据
+        """
+        if chunk.shape[0] == 0:
+            return chunk
+        
+        # 获取或初始化上一次的样本
+        state_key = f"_last_sample_{track_id}"
+        last_sample = getattr(self, state_key, None)
+        
+        if last_sample is not None and last_sample.shape[1] == chunk.shape[1]:
+            # 检测不连续性 - 如果第一个样本与上一个样本差异过大
+            threshold = 0.1  # 阈值，可以根据需要调整
+            diff = np.abs(chunk[0] - last_sample[0])
+            
+            if np.any(diff > threshold):
+                # 发现不连续性，应用平滑过渡
+                smooth_length = min(16, chunk.shape[0])  # 最多16样本的平滑
+                if smooth_length > 0:
+                    # 创建平滑过渡
+                    for channel in range(chunk.shape[1]):
+                        transition = np.linspace(last_sample[0, channel], chunk[0, channel], smooth_length)
+                        chunk[:smooth_length, channel] = transition
+        
+        # 保存最后的样本用于下次检测
+        if chunk.shape[0] > 0:
+            setattr(self, state_key, chunk[-1:].copy())
+        
+        return chunk
+    
+    def _apply_audio_effects_optimized(self, chunk: npt.NDArray, state: Dict[str, Any], frames: int) -> None:
+        """Optimized audio effects application"""
+        # Apply volume
+        volume = state.get('volume', 1.0)
+        if volume != 1.0:
+            self.audio_processor.apply_volume_inplace(chunk, volume)
+        
+        # Handle fade in/out
+        fade_progress = state.get('fade_progress')
+        fade_direction = state.get('fade_direction')
+        fade_duration = state.get('fade_duration', 0.05)
+        
+        if fade_direction and fade_progress is not None:
+            # Generate or cache fade in/out steps
+            fade_key = (fade_duration, frames)
+            if fade_key not in self.fade_step_cache:
+                self.fade_step_cache[fade_key] = frames / (fade_duration * self.sample_rate)
+            
+            fade_step = self.fade_step_cache[fade_key]
+            
+            if fade_direction == 'in':
+                fade_end = min(1.0, fade_progress + fade_step)
+                fade_env = np.linspace(fade_progress, fade_end, frames)
+                self.audio_processor.apply_fade_inplace(chunk, fade_env)
+                
+                if fade_end >= 1.0:
+                    state['fade_progress'] = None
+                    state['fade_direction'] = None
+                else:
+                    state['fade_progress'] = fade_end
+            
+            elif fade_direction == 'out':
+                fade_end = max(0.0, fade_progress - fade_step)
+                fade_env = np.linspace(fade_progress, fade_end, frames)
+                self.audio_processor.apply_fade_inplace(chunk, fade_env)
+                
+                if fade_end <= 0.0:
+                    state['playing'] = False
+                    state['fade_progress'] = None
+                    state['fade_direction'] = None
+                else:
+                    state['fade_progress'] = fade_end
+
+    def play_for_duration(self, track_id: str, duration_sec: float, 
+                         fade_in: bool = False, fade_out: bool = True, 
+                         fade_out_duration: float = None, volume: Optional[float] = None) -> bool:
+        """
+        播放指定时长后自动停止
+        
+        这是一个便捷方法，开始播放轨道并安排在指定时间后自动停止。
+        
+        Args:
+            track_id (str): 要播放的轨道ID
+            duration_sec (float): 播放持续时间（秒）
+            fade_in (bool, optional): 是否淡入开始. Defaults to False.
+            fade_out (bool, optional): 是否淡出停止. Defaults to True.
+            fade_out_duration (float, optional): 淡出时长（秒）. Defaults to None.
+            volume (float, optional): 播放音量. Defaults to None.
+            
+        Returns:
+            bool: 是否成功开始播放并安排停止
+            
+        Example:
+            >>> # 播放15秒后淡出停止
+            >>> engine.play_for_duration("intro", 15.0)
+            
+            >>> # 播放10秒，用2秒淡出停止
+            >>> engine.play_for_duration("music", 10.0, fade_out_duration=2.0)
+            
+            >>> # 淡入播放5秒后立即停止
+            >>> engine.play_for_duration("effect", 5.0, fade_in=True, fade_out=False)
+        """
+        try:
+            # 开始播放
+            self.play(track_id, fade_in=fade_in, volume=volume)
+            
+            # 安排停止
+            self.stop(track_id, fade_out=fade_out, delay_sec=duration_sec, fade_duration=fade_out_duration)
+            
+            logger.debug(f"已安排轨道 {track_id} 播放 {duration_sec} 秒后停止")
+            return True
+            
+        except Exception as e:
+            logger.error(f"播放定时轨道失败 {track_id}: {e}")
+            return False
 

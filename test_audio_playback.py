@@ -4,7 +4,7 @@
 
 测试目标：
 1. 主音轨播放 "声音素材.wav"
-2. 副音轨1播放 "副音轨.wav"，播放前后各有300ms静音
+2. 副音轨1播放 "副音轨.wav"，播放前后分别有300ms静音
 3. 使用AudioEngine内置的响度匹配确保音量一致性
 4. 使用AudioEngine内置的交叉淡入淡出实现无缝切换
 5. 检测是否有电流音或其他音频质量问题
@@ -21,6 +21,7 @@
 - 使用engine.match_loudness()进行响度匹配
 - 使用engine.crossfade()进行交叉淡入淡出
 - 音频质量监测：检测电流音、削波、信号稳定性
+- 使用silent_lpadding_ms和silent_rpadding_ms分别控制前后静音时长
 """
 
 import numpy as np
@@ -188,7 +189,7 @@ def main():
         # 加载音频文件
         print("\n正在加载音频文件...")
         
-        # 加载主音轨（声音素材.wav）
+        # 加载主音轨（声音素材.wav）- 无静音填充
         print(f"加载主音轨: {main_audio_file}")
         success_main = engine.load_track("main_track", main_audio_file, auto_normalize=True)
         if success_main:
@@ -197,11 +198,14 @@ def main():
             print("❌ 主音轨加载失败")
             return
         
-        # 加载副音轨（副音轨.wav）
-        print(f"加载副音轨1: {sub_audio_file}")
-        success_sub = engine.load_track("sub_track_1", sub_audio_file, auto_normalize=True)
+        # 加载副音轨（副音轨.wav）- 使用内置的300ms静音填充
+        print(f"加载副音轨1: {sub_audio_file} (前后各300ms静音填充)")
+        success_sub = engine.load_track("sub_track_1", sub_audio_file, 
+                                       auto_normalize=True, 
+                                       silent_lpadding_ms=300.0,  # 前面300ms静音
+                                       silent_rpadding_ms=300.0)  # 后面300ms静音
         if success_sub:
-            print("✅ 副音轨1加载成功")
+            print("✅ 副音轨1加载成功（已添加静音填充）")
         else:
             print("❌ 副音轨1加载失败")
             return
@@ -217,14 +221,27 @@ def main():
         if main_info:
             print(f"主音轨 - 时长: {main_info['duration']:.2f}秒, 采样率: {main_info.get('sample_rate', 'N/A')}Hz")
         if sub_info:
-            print(f"副音轨1 - 时长: {sub_info['duration']:.2f}秒, 采样率: {sub_info.get('sample_rate', 'N/A')}Hz")
+            lpadding = sub_info.get('silent_lpadding_ms', 0)
+            rpadding = sub_info.get('silent_rpadding_ms', 0)
+            padding_info = ""
+            if lpadding > 0 or rpadding > 0:
+                padding_info = f" (前{lpadding}ms+后{rpadding}ms静音填充)"
+            print(f"副音轨1 - 时长: {sub_info['duration']:.2f}秒, 采样率: {sub_info.get('sample_rate', 'N/A')}Hz{padding_info}")
+        
+        # 预先计算响度匹配（避免切换时耗时）
+        print("\n=== 预先计算响度匹配 ===")
+        print("正在分析音轨响度...")
+        main_vol, sub_vol = engine.match_loudness("main_track", "sub_track_1", target_loudness=0.7)
+        print(f"响度匹配完成:")
+        print(f"  主音轨建议音量: {main_vol:.3f}")
+        print(f"  副音轨建议音量: {sub_vol:.3f}")
         
         # 开始播放测试
         print("\n开始无缝切换播放测试...")
-        print("播放特性：副音轨前后各有300ms静音，使用AudioEngine内置的交叉淡入淡出无缝切换")
+        print("播放特性：副音轨使用左右分别的静音填充（前300ms+后300ms），使用预计算的响度匹配实现无缝切换")
         
         # 播放主音轨
-        engine.set_volume("main_track", 0.7)
+        engine.set_volume("main_track", main_vol)  # 使用预计算的音量
         engine.play("main_track", fade_in=True, loop=True)
         print("✅ 主音轨开始播放")
         
@@ -232,30 +249,28 @@ def main():
         print("主音轨独奏中...")
         time.sleep(3)
         
-        # 副音轨前静音 - 300ms
-        print("副音轨前静音 300ms...")
-        time.sleep(0.3)
-        
-        # 交叉淡入淡出切换到副音轨
-        print("开始无缝切换到副音轨...")
-        engine.crossfade("main_track", "sub_track_1", 0.5)
+        # 交叉淡入淡出切换到副音轨（使用预计算音量，避免实时响度匹配）
+        print("开始无缝切换到副音轨（使用预计算响度，无额外延迟）...")
+        start_crossfade_time = time.time()
+        engine.crossfade("main_track", "sub_track_1", duration=0.5, to_track_volume=sub_vol)
+        crossfade_start_time = time.time() - start_crossfade_time
+        print(f"✅ 交叉淡入淡出启动耗时: {crossfade_start_time*1000:.1f}ms")
         
         # 获取副音轨时长来控制播放时间
         if sub_info and 'duration' in sub_info:
             sub_duration = sub_info['duration']
-            print(f"副音轨播放中...（时长: {sub_duration:.2f}秒）")
+            print(f"副音轨播放中...（总时长: {sub_duration:.2f}秒，包含前后静音）")
             time.sleep(sub_duration)
         else:
             print("副音轨播放中...（使用默认时长5秒）")
             time.sleep(5)
         
-        # 副音轨后静音 - 300ms
-        print("副音轨后静音 300ms...")
-        time.sleep(0.3)
-        
-        # 交叉淡入淡出切换回主音轨
-        print("开始无缝切换回主音轨...")
-        engine.crossfade("sub_track_1", "main_track", 0.5)
+        # 交叉淡入淡出切换回主音轨（使用预计算音量）
+        print("开始无缝切换回主音轨（使用预计算响度，无额外延迟）...")
+        start_crossfade_time = time.time()
+        engine.crossfade("sub_track_1", "main_track", duration=0.5, to_track_volume=main_vol)
+        crossfade_start_time = time.time() - start_crossfade_time
+        print(f"✅ 交叉淡入淡出启动耗时: {crossfade_start_time*1000:.1f}ms")
         print("✅ 主音轨恢复播放")
         
         # 音频质量监测（在主音轨恢复播放后）
