@@ -26,9 +26,8 @@
 
 import numpy as np
 import time
-import sys
 import os
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 
 def analyze_audio_quality(engine, duration=5.0):

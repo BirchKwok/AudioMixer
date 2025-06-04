@@ -5,7 +5,7 @@ Basic tests for AudioMixer library
 import pytest
 import numpy as np
 import time
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 
 class TestAudioEngine:
@@ -246,7 +246,7 @@ class TestBufferPool:
     
     def test_buffer_pool_creation(self):
         """Test buffer pool creation and basic operations"""
-        from audiomixer import BufferPool
+        from realtimemix import BufferPool
         
         pool = BufferPool(buffer_size=1024, channels=2, pool_size=4)
         
@@ -268,7 +268,7 @@ class TestAudioProcessor:
     
     def test_volume_application(self):
         """Test volume application"""
-        from audiomixer import AudioProcessor
+        from realtimemix import AudioProcessor
         
         # Create test audio data
         audio = np.ones((100, 2), dtype=np.float32)
@@ -283,7 +283,7 @@ class TestAudioProcessor:
     
     def test_fade_application(self):
         """Test fade effect application"""
-        from audiomixer import AudioProcessor
+        from realtimemix import AudioProcessor
         
         # Create test audio data
         audio = np.ones((100, 2), dtype=np.float32)
@@ -298,7 +298,7 @@ class TestAudioProcessor:
     
     def test_soft_limiter(self):
         """Test soft limiter functionality"""
-        from audiomixer import AudioProcessor
+        from realtimemix import AudioProcessor
         
         # Create audio data that clips
         audio = np.ones((100, 2), dtype=np.float32) * 2.0  # Above threshold

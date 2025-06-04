@@ -14,7 +14,7 @@
 
 import time
 import os
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 
 def demo_padding_combinations():

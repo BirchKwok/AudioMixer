@@ -71,7 +71,11 @@ def run_command(cmd, check=True):
     
     if check and result.returncode != 0:
         print(f"Command failed: {cmd}")
-        print(f"Error: {result.stderr}")
+        print(f"Return code: {result.returncode}")
+        if result.stderr:
+            print(f"Error output: {result.stderr}")
+        if result.stdout:
+            print(f"Standard output: {result.stdout}")
         sys.exit(1)
     
     return result
@@ -125,13 +129,49 @@ def upload_to_pypi(dry_run=False):
     print("Uploading to PyPI...")
     
     # Check the distribution files first
+    print("Checking distribution files...")
     run_command("twine check dist/*")
     
-    # Upload to PyPI
-    # Note: This requires TWINE_USERNAME and TWINE_PASSWORD environment variables
-    # or ~/.pypirc configuration file with API token
-    run_command("twine upload dist/*")
-    print("Package uploaded to PyPI successfully ✅")
+    # List what files will be uploaded
+    result = run_command("ls -la dist/", check=False)
+    print("Files to upload:")
+    print(result.stdout)
+    
+    # Check if PyPI credentials are configured
+    print("Checking PyPI credentials...")
+    
+    # Try to get repository info (this will show if credentials are set up)
+    result = run_command("twine check --repository pypi dist/* 2>&1 || true", check=False)
+    
+    print("Attempting to upload to PyPI...")
+    print("Note: This requires PyPI credentials to be configured.")
+    print("You can set them via:")
+    print("  1. Environment variables: TWINE_USERNAME and TWINE_PASSWORD")
+    print("  2. Config file: ~/.pypirc")
+    print("  3. Interactive prompt (if not set)")
+    
+    # Upload to PyPI with more verbose output
+    try:
+        result = run_command("twine upload dist/* --verbose", check=False)
+        if result.returncode != 0:
+            print("\n❌ PyPI upload failed!")
+            print("Common issues:")
+            print("  - Missing credentials (set TWINE_USERNAME and TWINE_PASSWORD)")
+            print("  - Package version already exists on PyPI")
+            print("  - Network connection issues")
+            print("  - Package name conflicts")
+            
+            if result.stderr:
+                print(f"\nDetailed error: {result.stderr}")
+            if result.stdout:
+                print(f"\nOutput: {result.stdout}")
+            
+            sys.exit(1)
+        else:
+            print("Package uploaded to PyPI successfully ✅")
+    except Exception as e:
+        print(f"Exception during upload: {e}")
+        sys.exit(1)
 
 
 def main():

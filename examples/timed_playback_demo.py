@@ -8,7 +8,7 @@ AudioMixer 内置定时功能演示
 
 import numpy as np
 import time
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 
 def generate_test_audio(frequency, duration, sample_rate=48000):

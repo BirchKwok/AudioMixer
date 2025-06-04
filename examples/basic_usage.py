@@ -7,7 +7,7 @@ This example demonstrates the core functionality of the AudioMixer library.
 
 import numpy as np
 import time
-from audiomixer import AudioEngine
+from realtimemix import AudioEngine
 
 
 def main():
