@@ -77,6 +77,63 @@ def run_command(cmd, check=True):
     return result
 
 
+def check_pypi_dependencies():
+    """Check if required PyPI publishing dependencies are installed"""
+    try:
+        run_command("python -c 'import build'", check=False)
+        build_available = True
+    except:
+        build_available = False
+    
+    try:
+        run_command("python -c 'import twine'", check=False)
+        twine_available = True
+    except:
+        twine_available = False
+    
+    if not build_available or not twine_available:
+        print("Missing dependencies for PyPI publishing:")
+        if not build_available:
+            print("  - build: pip install build")
+        if not twine_available:
+            print("  - twine: pip install twine")
+        print("\nInstalling dependencies...")
+        run_command("pip install build twine")
+
+
+def build_package():
+    """Build the package for PyPI"""
+    print("Building package...")
+    
+    # Clean previous builds
+    dist_dir = Path("dist")
+    if dist_dir.exists():
+        run_command("rm -rf dist/")
+    
+    # Build source distribution and wheel
+    run_command("python -m build")
+    print("Package built successfully ✅")
+
+
+def upload_to_pypi(dry_run=False):
+    """Upload package to PyPI"""
+    if dry_run:
+        print("DRY RUN - Would upload to PyPI")
+        run_command("twine check dist/*")
+        return
+    
+    print("Uploading to PyPI...")
+    
+    # Check the distribution files first
+    run_command("twine check dist/*")
+    
+    # Upload to PyPI
+    # Note: This requires TWINE_USERNAME and TWINE_PASSWORD environment variables
+    # or ~/.pypirc configuration file with API token
+    run_command("twine upload dist/*")
+    print("Package uploaded to PyPI successfully ✅")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Release helper for AudioMixer")
     parser.add_argument(
@@ -94,6 +151,16 @@ def main():
         action="store_true",
         help="Skip running tests before release"
     )
+    parser.add_argument(
+        "--publish-pypi",
+        action="store_true",
+        help="Automatically publish to PyPI after successful release"
+    )
+    parser.add_argument(
+        "--skip-git",
+        action="store_true",
+        help="Skip git operations (commit, tag, push instructions)"
+    )
     
     args = parser.parse_args()
     
@@ -109,14 +176,18 @@ def main():
         if args.dry_run:
             print("DRY RUN - No changes will be made")
             print(f"Would update version from {current_version} to {new_version}")
-            print(f"Would create tag v{new_version}")
+            if not args.skip_git:
+                print(f"Would create tag v{new_version}")
+            if args.publish_pypi:
+                print("Would build and upload package to PyPI")
             return
         
-        # Check if working directory is clean
-        result = run_command("git status --porcelain")
-        if result.stdout.strip():
-            print("Working directory is not clean. Please commit or stash changes.")
-            sys.exit(1)
+        # Check if working directory is clean (unless skipping git)
+        if not args.skip_git:
+            result = run_command("git status --porcelain")
+            if result.stdout.strip():
+                print("Working directory is not clean. Please commit or stash changes.")
+                sys.exit(1)
         
         # Run tests unless skipped
         if not args.skip_tests:
@@ -127,20 +198,38 @@ def main():
         # Update version
         update_version_in_file(new_version)
         
-        # Commit version bump
-        run_command(f"git add pyproject.toml")
-        run_command(f'git commit -m "bump: version to {new_version}"')
+        # Git operations
+        if not args.skip_git:
+            # Commit version bump
+            run_command(f"git add pyproject.toml")
+            run_command(f'git commit -m "bump: version to {new_version}"')
+            
+            # Create tag
+            tag_name = f"v{new_version}"
+            run_command(f"git tag {tag_name}")
         
-        # Create and push tag
-        tag_name = f"v{new_version}"
-        run_command(f"git tag {tag_name}")
+        # PyPI publishing
+        if args.publish_pypi:
+            check_pypi_dependencies()
+            build_package()
+            upload_to_pypi(dry_run=args.dry_run)
         
         print(f"\n✅ Release {new_version} prepared!")
-        print(f"Tag {tag_name} created locally.")
-        print("\nTo complete the release:")
-        print(f"  git push origin main")
-        print(f"  git push origin {tag_name}")
-        print("\nThis will trigger the release workflow on GitHub.")
+        
+        if not args.skip_git:
+            tag_name = f"v{new_version}"
+            print(f"Tag {tag_name} created locally.")
+            print("\nTo complete the release:")
+            print(f"  git push origin main")
+            print(f"  git push origin {tag_name}")
+            print("\nThis will trigger the release workflow on GitHub.")
+        
+        if args.publish_pypi:
+            print(f"\n🎉 Package {new_version} has been published to PyPI!")
+            print(f"Install with: pip install audiomixer=={new_version}")
+        elif not args.dry_run:
+            print(f"\nTo publish to PyPI later, run:")
+            print(f"  python scripts/release.py {args.bump_type} --publish-pypi --skip-git")
         
     except Exception as e:
         print(f"Error: {e}")

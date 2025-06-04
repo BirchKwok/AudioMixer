@@ -1,9 +1,5 @@
 # AudioMixer
 
-[![PyPI version](https://badge.fury.io/py/audiomixer.svg)](https://badge.fury.io/py/audiomixer)
-[![Python versions](https://img.shields.io/pypi/pyversions/audiomixer.svg)](https://pypi.org/project/audiomixer/)
-[![License](https://img.shields.io/github/license/yourusername/audiomixer.svg)](LICENSE)
-
 一个高性能的Python实时音频混音引擎，专为专业音频应用、游戏开发和多媒体项目设计。
 
 ## 特性
@@ -44,7 +40,7 @@ pip install audiomixer[all]
 
 ### 开发安装
 ```bash
-git clone https://github.com/yourusername/audiomixer.git
+git clone https://github.com/birchkwok/audiomixer.git
 cd audiomixer
 pip install -e .[dev]
 ```
