@@ -14,8 +14,12 @@ from typing import Union, Optional, Callable, Dict, Set, Tuple, Any, List
 import numpy.typing as npt
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('AudioEngine')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("AudioEngine")
 
 # Only ignore specific RuntimeWarning
-warnings.filterwarnings("ignore", category=RuntimeWarning, message="divide by zero encountered in .*") 
+warnings.filterwarnings(
+    "ignore", category=RuntimeWarning, message="divide by zero encountered in .*"
+)

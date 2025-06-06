@@ -13,17 +13,11 @@ RealtimeMix - 高性能多轨音频混音器
 
 from .utils import logger
 from .streaming import StreamingTrackData
-from .buffer import BufferPool  
+from .buffer import BufferPool
 from .processor import AudioProcessor
 from .engine import AudioEngine
 
 # 导出主要类
-__all__ = [
-    'AudioEngine',
-    'StreamingTrackData', 
-    'BufferPool',
-    'AudioProcessor',
-    'logger'
-]
+__all__ = ["AudioEngine", "StreamingTrackData", "BufferPool", "AudioProcessor", "logger"]
 
-__version__ = '1.1.1'
+__version__ = "1.1.1"
