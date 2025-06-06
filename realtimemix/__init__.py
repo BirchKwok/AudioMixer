@@ -20,4 +20,4 @@ from .engine import AudioEngine
 # 导出主要类
 __all__ = ["AudioEngine", "StreamingTrackData", "BufferPool", "AudioProcessor", "logger"]
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
