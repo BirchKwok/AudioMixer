@@ -1560,6 +1560,7 @@ class AudioEngine:
         
         try:
             # 直接分析音频数据，无需播放
+            logger.info(f"🔇 Using silent loudness analysis for {track_id}")
             with self.lock:
                 if track_id in self.tracks:
                     # 预加载的音轨，直接分析数据

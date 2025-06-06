@@ -40,7 +40,7 @@ class StreamingTrackData:
     """
     
     def __init__(self, track_id: str, file_path: str, engine_sample_rate: int = 48000, 
-                 engine_channels: int = 2, buffer_seconds: float = 15.0):
+                 engine_channels: int = 2, buffer_seconds: float = 15.0, unsampled_mode: bool = False):
         """
         初始化流式轨道数据管理器
         
@@ -50,6 +50,7 @@ class StreamingTrackData:
             engine_sample_rate (int, optional): 引擎采样率. Defaults to 48000.
             engine_channels (int, optional): 引擎声道数. Defaults to 2.
             buffer_seconds (float, optional): 缓冲区时长（秒）. Defaults to 15.0.
+            unsampled_mode (bool, optional): 是否启用unsampled模式（跳过重采样）. Defaults to False.
             
         Raises:
             Exception: 如果文件无法读取或格式不支持
@@ -68,6 +69,7 @@ class StreamingTrackData:
         self.engine_sample_rate = engine_sample_rate
         self.engine_channels = engine_channels
         self.buffer_seconds = buffer_seconds
+        self.unsampled_mode = unsampled_mode  # 添加unsampled模式标记
         
         # 音频缓冲区 - 使用deque进行高效的FIFO操作
         self.audio_buffer = deque()
@@ -263,7 +265,7 @@ class StreamingTrackData:
         处理音频块：重采样、声道转换
         
         对读取的音频块进行必要的处理，包括采样率转换和声道转换，
-        以匹配引擎的要求。
+        以匹配引擎的要求。在unsampled模式下跳过重采样。
         
         Args:
             chunk (np.ndarray): 原始音频数据块
@@ -271,13 +273,20 @@ class StreamingTrackData:
         Returns:
             np.ndarray: 处理后的音频数据块
         """
-        # 重采样
-        if self.file_sample_rate != self.engine_sample_rate:
-            chunk = self._resample_chunk(chunk)
-        
-        # 声道转换
-        if self.file_channels != self.engine_channels:
-            chunk = self._convert_channels(chunk)
+        # unsampled模式：跳过重采样，只进行声道转换
+        if self.unsampled_mode:
+            # 只进行声道转换，不重采样
+            if self.file_channels != self.engine_channels:
+                chunk = self._convert_channels(chunk)
+        else:
+            # 普通模式：进行重采样和声道转换
+            # 重采样
+            if self.file_sample_rate != self.engine_sample_rate:
+                chunk = self._resample_chunk(chunk)
+            
+            # 声道转换
+            if self.file_channels != self.engine_channels:
+                chunk = self._convert_channels(chunk)
         
         return chunk.astype(np.float32)
     
@@ -386,62 +395,118 @@ class StreamingTrackData:
             # 记录上一次的音频样本，用于平滑过渡
             last_sample = getattr(self, '_last_sample', np.zeros((1, self.engine_channels), dtype=np.float32))
             
+            # 检查缓冲区状态
+            buffer_frames_available = sum(chunk.shape[0] for chunk in self.audio_buffer)
+            
+            # 如果缓冲区严重不足且未到文件末尾，触发紧急加载
+            if buffer_frames_available < frames_needed // 2 and not self.eof_reached and self.loading:
+                # 尝试唤醒加载线程或增加加载优先级
+                pass  # 后续可以添加更积极的加载策略
+            
+            # 从缓冲区块中提取数据
             while frames_filled < frames_needed and self.audio_buffer:
                 chunk = self.audio_buffer[0]
-                available_frames = chunk.shape[0]
-                needed_frames = frames_needed - frames_filled
+                available_in_chunk = chunk.shape[0]
+                needed_from_chunk = min(available_in_chunk, frames_needed - frames_filled)
                 
-                if available_frames <= needed_frames:
-                    # 使用整个块
-                    output[frames_filled:frames_filled + available_frames] = chunk
-                    frames_filled += available_frames
+                # 验证chunk数据有效性
+                if np.any(np.isnan(chunk)) or np.any(np.isinf(chunk)):
+                    logger.warning(f"Invalid chunk data detected in track {self.track_id}, skipping")
+                    self.audio_buffer.popleft()
+                    continue
+                
+                # 复制数据
+                try:
+                    output[frames_filled:frames_filled + needed_from_chunk] = chunk[:needed_from_chunk]
+                    frames_filled += needed_from_chunk
                     
-                    # 保存最后的样本
-                    if chunk.shape[0] > 0:
-                        last_sample = chunk[-1:]
-                    
+                    # 更新last_sample为有效数据
+                    if needed_from_chunk > 0:
+                        last_sample = chunk[needed_from_chunk - 1:needed_from_chunk]
+                except Exception as e:
+                    logger.error(f"Error copying chunk data: {e}")
+                    self.audio_buffer.popleft()
+                    continue
+                
+                # 如果使用了整个chunk，移除它
+                if needed_from_chunk == available_in_chunk:
                     self.audio_buffer.popleft()
                 else:
-                    # 使用块的一部分
-                    output[frames_filled:frames_filled + needed_frames] = chunk[:needed_frames]
-                    
-                    # 保存最后的样本
-                    if needed_frames > 0:
-                        last_sample = chunk[needed_frames-1:needed_frames]
-                    
-                    # 更新剩余的块
-                    self.audio_buffer[0] = chunk[needed_frames:]
-                    frames_filled += needed_frames
+                    # 否则更新chunk（移除已使用的部分）
+                    remaining_chunk = chunk[needed_from_chunk:]
+                    self.audio_buffer[0] = remaining_chunk
+                    break
             
-            # 如果缓冲区数据不足，进行平滑填充
+            # 如果缓冲区数据不足，进行智能填充
             if frames_filled < frames_needed:
-                if not self.eof_reached:
-                    self.buffer_underruns += 1
-                
                 remaining_frames = frames_needed - frames_filled
                 
-                # 如果有之前的样本，使用淡出填充而不是直接零填充
-                if frames_filled > 0 or hasattr(self, '_last_sample'):
-                    fade_length = min(remaining_frames, 64)  # 最多64样本的淡出
+                # 只有在非EOF或有有效last_sample时才记录下溢
+                if not self.eof_reached:
+                    self.buffer_underruns += 1
+                    if self.buffer_underruns % 10 == 1:  # 每10次下溢记录一次日志，避免日志泛滥
+                        logger.warning(f"Buffer underrun #{self.buffer_underruns} in track {self.track_id}, missing {remaining_frames} frames")
+                
+                # 智能填充策略
+                if frames_filled > 0 or (hasattr(self, '_last_sample') and np.any(last_sample != 0)):
+                    # 有历史数据：使用渐进式淡出
+                    fade_length = min(remaining_frames, 128)  # 增加淡出长度以获得更平滑的过渡
                     
-                    if fade_length > 0:
-                        # 创建淡出序列
-                        fade_out = np.linspace(1.0, 0.0, fade_length)[:, np.newaxis]
-                        fade_chunk = last_sample * fade_out
+                    if fade_length > 0 and last_sample.shape[0] > 0:
+                        # 创建更平滑的淡出曲线（指数+线性组合）
+                        linear_fade = np.linspace(1.0, 0.0, fade_length)
+                        exp_fade = np.exp(-np.arange(fade_length) * 0.05)  # 更缓和的指数衰减
+                        combined_fade = (linear_fade * 0.3 + exp_fade * 0.7)[:, np.newaxis]  # 组合衰减
                         
-                        # 应用淡出
-                        output[frames_filled:frames_filled + fade_length] = fade_chunk
-                        frames_filled += fade_length
+                        try:
+                            fade_chunk = last_sample * combined_fade
+                            output[frames_filled:frames_filled + fade_length] = fade_chunk
+                            frames_filled += fade_length
+                        except Exception as e:
+                            logger.error(f"Error applying fade: {e}")
                     
-                    # 剩余部分填充零（已经是零了）
-                # 如果这是第一次或没有历史数据，直接零填充（output已经初始化为零）
+                    # 剩余部分使用低级白噪声而不是完全静音，以避免数字静音造成的不自然感
+                    if frames_filled < frames_needed:
+                        remaining_silence = frames_needed - frames_filled
+                        # 添加极低级别的抖动噪声来打破数字静音
+                        noise_level = 1e-6  # 非常低的噪声级别
+                        noise = np.random.normal(0, noise_level, (remaining_silence, self.engine_channels)).astype(np.float32)
+                        output[frames_filled:] = noise
+                elif self.eof_reached:
+                    # 文件结束：完全静音是合适的
+                    pass  # output已经初始化为零
+                else:
+                    # 没有历史数据且非EOF：可能是初始化阶段，添加轻微抖动
+                    noise_level = 1e-7
+                    noise = np.random.normal(0, noise_level, (remaining_frames, self.engine_channels)).astype(np.float32)
+                    output[frames_filled:] = noise
             
-            # 保存最后的样本用于下次调用
+            # 保存最后的样本用于下次调用（确保数据有效）
             if frames_filled > 0:
-                self._last_sample = output[-1:]
+                try:
+                    valid_end_index = frames_filled - 1
+                    if valid_end_index >= 0:
+                        self._last_sample = output[valid_end_index:valid_end_index + 1].copy()
+                        # 验证保存的样本
+                        if np.any(np.isnan(self._last_sample)) or np.any(np.isinf(self._last_sample)):
+                            self._last_sample = np.zeros((1, self.engine_channels), dtype=np.float32)
+                except Exception as e:
+                    logger.error(f"Error saving last sample: {e}")
+                    self._last_sample = np.zeros((1, self.engine_channels), dtype=np.float32)
             
-            # 更新播放位置
-            self.playback_position += frames_filled
+            # 更新播放位置（仅基于实际填充的帧数）
+            self.playback_position += min(frames_filled, frames_needed)
+            
+            # 验证输出数据
+            if np.any(np.isnan(output)) or np.any(np.isinf(output)):
+                logger.error(f"Invalid output data in track {self.track_id}, clearing")
+                output.fill(0)
+            
+            # 应用软限制防止削波
+            peak = np.max(np.abs(output))
+            if peak > 0.99:
+                output *= (0.95 / peak)
+                logger.debug(f"Applied peak limiting in streaming track {self.track_id}: {peak:.3f} -> 0.95")
             
             return output
     

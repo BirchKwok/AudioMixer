@@ -49,13 +49,33 @@ class BufferPool:
         Note:
             返回的缓冲区已经被清零，可以直接使用
         """
-        with self._lock:
-            if self.pool:
-                buffer = self.pool.popleft()
-                buffer.fill(0)  # Clear buffer
-                return buffer
-        # Pool is empty, create new buffer
-        return np.zeros((self.buffer_size, self.channels), dtype=np.float32)
+        try:
+            with self._lock:
+                if self.pool:
+                    buffer = self.pool.popleft()
+                    # 验证缓冲区完整性
+                    if (buffer.shape != (self.buffer_size, self.channels) or 
+                        buffer.dtype != np.float32):
+                        logger.warning("Invalid buffer in pool, creating new one")
+                        buffer = np.zeros((self.buffer_size, self.channels), dtype=np.float32)
+                    else:
+                        # 确保缓冲区被正确清零
+                        buffer.fill(0.0)
+                        # 验证没有NaN或Inf值
+                        if np.any(np.isnan(buffer)) or np.any(np.isinf(buffer)):
+                            logger.warning("Corrupted buffer detected, replacing")
+                            buffer = np.zeros((self.buffer_size, self.channels), dtype=np.float32)
+                    return buffer
+        except Exception as e:
+            logger.error(f"Error accessing buffer pool: {e}")
+        
+        # Pool is empty or error occurred, create new buffer
+        try:
+            return np.zeros((self.buffer_size, self.channels), dtype=np.float32)
+        except Exception as e:
+            logger.error(f"Failed to create new buffer: {e}")
+            # 最后的紧急措施
+            return np.zeros((1024, 2), dtype=np.float32)  # 使用默认大小
     
     def return_buffer(self, buffer: npt.NDArray[np.float32]) -> None:
         """
@@ -67,6 +87,23 @@ class BufferPool:
         Note:
             如果池已满，缓冲区将被丢弃（让垃圾收集器处理）
         """
-        with self._lock:
-            if len(self.pool) < self.pool.maxlen:
-                self.pool.append(buffer) 
+        try:
+            # 验证缓冲区有效性
+            if (buffer is None or 
+                buffer.shape != (self.buffer_size, self.channels) or 
+                buffer.dtype != np.float32):
+                logger.debug("Invalid buffer returned, discarding")
+                return
+            
+            # 检查数据完整性
+            if np.any(np.isnan(buffer)) or np.any(np.isinf(buffer)):
+                logger.debug("Corrupted buffer returned, discarding")
+                return
+            
+            with self._lock:
+                if len(self.pool) < self.pool.maxlen:
+                    self.pool.append(buffer)
+                # 如果池已满，让垃圾收集器处理这个缓冲区
+        except Exception as e:
+            logger.error(f"Error returning buffer to pool: {e}")
+            # 忽略错误，让垃圾收集器处理缓冲区 
