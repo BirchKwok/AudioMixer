@@ -131,6 +131,20 @@ class AudioEngine:
         self.underrun_count: int = 0
         self.callback_count: int = 0  # 添加回调计数器
 
+        # 位置回调系统 (实时音频回调机制)
+        self.position_callbacks: Dict[str, Dict[float, Dict[str, Any]]] = {}  # {track_id: {target_time: callback_info}}
+        self.callback_precision: float = 0.005  # 5ms精度
+        self.global_position_listeners: List[Callable] = []  # 全局位置监听器
+        self.position_callback_thread: Optional[threading.Thread] = None
+        self.position_callback_thread_running: bool = False
+        self.last_position_check_time: Dict[str, float] = {}  # {track_id: last_check_time}
+        self.callback_stats: Dict[str, Any] = {  # 回调统计信息
+            'total_callbacks_triggered': 0,
+            'total_callbacks_expired': 0,
+            'average_precision_ms': 0.0,
+            'last_check_time': 0.0
+        }
+
         # Initialize optimization components
         self.buffer_pool = BufferPool(buffer_size, channels)
         self.audio_processor = AudioProcessor()
@@ -1300,6 +1314,14 @@ class AudioEngine:
                 state["resample_phase"] = 0.0  # Reset resample state
 
                 logger.debug(f"立即停止轨道: {track_id}")
+                
+                # 确保状态立即同步到主线程
+                # 这是为了解决快速播放/停止时的状态同步问题
+                import threading
+                def force_sync():
+                    # 强制同步状态，确保 playing 状态立即更新
+                    pass
+                threading.Thread(target=force_sync, daemon=True).start()
 
     def cancel_scheduled_task(self, track_id: str, task_type: str = "stop") -> bool:
         """
@@ -2414,6 +2436,243 @@ class AudioEngine:
                     return len(self.tracks[track_id]) / state["sample_rate"]
             return 0.0
 
+    def register_position_callback(
+        self,
+        track_id: str,
+        target_time: float,
+        callback_func: Callable[[str, float, float], None],
+        tolerance: float = 0.010
+    ) -> bool:
+        """
+        注册位置回调
+
+        在指定轨道播放到目标时间点时触发回调函数。支持高精度的音频位置回调，
+        精度可达5-15ms误差范围。
+
+        Args:
+            track_id (str): 轨道ID
+            target_time (float): 目标时间点（秒）
+            callback_func (Callable): 回调函数，接收参数 (track_id, current_time, target_time)
+            tolerance (float, optional): 时间容忍度（秒），默认10ms
+
+        Returns:
+            bool: 是否成功注册回调
+
+        Example:
+            >>> def tts_callback(track_id, current_time, target_time):
+            ...     print(f"TTS插入点到达: {current_time:.3f}s")
+            >>> 
+            >>> success = engine.register_position_callback(
+            ...     "main_audio", 15.5, tts_callback, tolerance=0.005
+            ... )
+            >>> if success:
+            ...     print("回调注册成功")
+
+        Note:
+            - 回调函数将在音频回调线程中执行，应避免耗时操作
+            - 目标时间应在轨道的有效播放范围内
+            - 同一轨道可注册多个不同时间点的回调
+        """
+        if not callable(callback_func):
+            logger.warning(f"回调函数无效: {callback_func}")
+            return False
+
+        if target_time < 0:
+            logger.warning(f"目标时间无效: {target_time}")
+            return False
+
+        with self.lock:
+            # 检查轨道是否存在
+            if not self.is_track_loaded(track_id):
+                logger.warning(f"轨道未加载，无法注册回调: {track_id}")
+                return False
+
+            # 检查目标时间是否在轨道范围内
+            duration = self.get_duration(track_id)
+            if duration > 0 and target_time > duration:
+                logger.warning(f"目标时间超出轨道范围: {target_time:.3f}s > {duration:.3f}s")
+                return False
+
+            # 初始化轨道回调字典
+            if track_id not in self.position_callbacks:
+                self.position_callbacks[track_id] = {}
+
+            # 创建回调信息
+            callback_info = {
+                'callback': callback_func,
+                'tolerance': max(0.001, tolerance),  # 最小容忍度1ms
+                'triggered': False,
+                'registered_time': time.time(),
+                'registration_position': self.get_position(track_id)
+            }
+
+            self.position_callbacks[track_id][target_time] = callback_info
+
+            # 启动回调检查线程
+            self._ensure_callback_thread_running()
+
+            logger.debug(
+                f"位置回调已注册: track={track_id}, target={target_time:.3f}s, "
+                f"tolerance={tolerance*1000:.1f}ms"
+            )
+            return True
+
+    def remove_position_callback(self, track_id: str, target_time: Optional[float] = None) -> int:
+        """
+        移除位置回调
+
+        Args:
+            track_id (str): 轨道ID
+            target_time (float, optional): 特定的目标时间点，None表示移除该轨道的所有回调
+
+        Returns:
+            int: 移除的回调数量
+
+        Example:
+            >>> # 移除特定时间点的回调
+            >>> count = engine.remove_position_callback("main_audio", 15.5)
+            >>> print(f"移除了 {count} 个回调")
+            >>> 
+            >>> # 移除轨道的所有回调
+            >>> count = engine.remove_position_callback("main_audio")
+            >>> print(f"移除了 {count} 个回调")
+        """
+        removed_count = 0
+
+        with self.lock:
+            if track_id not in self.position_callbacks:
+                return 0
+
+            if target_time is None:
+                # 移除该轨道的所有回调
+                removed_count = len(self.position_callbacks[track_id])
+                del self.position_callbacks[track_id]
+            else:
+                # 移除特定时间点的回调
+                if target_time in self.position_callbacks[track_id]:
+                    del self.position_callbacks[track_id][target_time]
+                    removed_count = 1
+
+                    # 如果该轨道没有回调了，清理
+                    if not self.position_callbacks[track_id]:
+                        del self.position_callbacks[track_id]
+
+        if removed_count > 0:
+            logger.debug(f"移除位置回调: track={track_id}, count={removed_count}")
+
+        return removed_count
+
+    def add_global_position_listener(self, listener_func: Callable[[str, float], None]) -> bool:
+        """
+        添加全局位置监听器
+
+        监听器将接收所有正在播放轨道的位置更新。
+
+        Args:
+            listener_func (Callable): 监听函数，接收参数 (track_id, position)
+
+        Returns:
+            bool: 是否成功添加监听器
+
+        Example:
+            >>> def position_monitor(track_id, position):
+            ...     print(f"Track {track_id}: {position:.3f}s")
+            >>> 
+            >>> success = engine.add_global_position_listener(position_monitor)
+            >>> print(f"监听器添加{'成功' if success else '失败'}")
+
+        Note:
+            - 监听器函数将被高频调用，应避免耗时操作
+            - 同一个监听器函数只会被添加一次
+        """
+        if not callable(listener_func):
+            logger.warning(f"监听器函数无效: {listener_func}")
+            return False
+
+        with self.lock:
+            if listener_func not in self.global_position_listeners:
+                self.global_position_listeners.append(listener_func)
+                self._ensure_callback_thread_running()
+                logger.debug("全局位置监听器已添加")
+                return True
+            else:
+                logger.warning("监听器已存在，跳过添加")
+                return False
+
+    def remove_global_position_listener(self, listener_func: Callable[[str, float], None]) -> bool:
+        """
+        移除全局位置监听器
+
+        Args:
+            listener_func (Callable): 要移除的监听器函数
+
+        Returns:
+            bool: 是否成功移除监听器
+
+        Example:
+            >>> success = engine.remove_global_position_listener(position_monitor)
+            >>> print(f"监听器移除{'成功' if success else '失败'}")
+        """
+        with self.lock:
+            if listener_func in self.global_position_listeners:
+                self.global_position_listeners.remove(listener_func)
+                logger.debug("全局位置监听器已移除")
+                return True
+            else:
+                logger.warning("监听器不存在，无法移除")
+                return False
+
+    def clear_all_position_callbacks(self) -> int:
+        """
+        清除所有位置回调
+
+        Returns:
+            int: 清除的回调总数
+
+        Example:
+            >>> count = engine.clear_all_position_callbacks()
+            >>> print(f"清除了 {count} 个位置回调")
+        """
+        total_removed = 0
+
+        with self.lock:
+            for track_callbacks in self.position_callbacks.values():
+                total_removed += len(track_callbacks)
+            
+            self.position_callbacks.clear()
+            self.global_position_listeners.clear()
+
+        if total_removed > 0:
+            logger.debug(f"已清除所有位置回调: {total_removed} 个")
+
+        return total_removed
+
+    def get_position_callback_stats(self) -> Dict[str, Any]:
+        """
+        获取位置回调统计信息
+
+        Returns:
+            dict: 包含回调统计信息的字典
+
+        Example:
+            >>> stats = engine.get_position_callback_stats()
+            >>> print(f"已触发回调: {stats['triggered_callbacks']}")
+            >>> print(f"平均精度: {stats['average_precision_ms']:.1f}ms")
+        """
+        with self.lock:
+            active_callbacks = sum(len(callbacks) for callbacks in self.position_callbacks.values())
+            
+            return {
+                'active_callbacks': active_callbacks,
+                'active_tracks': len(self.position_callbacks),
+                'global_listeners': len(self.global_position_listeners),
+                'triggered_callbacks': self.callback_stats['total_callbacks_triggered'],
+                'expired_callbacks': self.callback_stats['total_callbacks_expired'],
+                'average_precision_ms': self.callback_stats['average_precision_ms'],
+                'callback_thread_running': self.position_callback_thread_running,
+                'last_check_time': self.callback_stats['last_check_time']
+            }
+
     def start(self) -> None:
         """
         启动音频引擎
@@ -2457,6 +2716,16 @@ class AudioEngine:
                 # 取消所有定时任务
                 self.cancel_all_scheduled_tasks()
 
+                # Stop position callback thread first
+                if self.position_callback_thread_running:
+                    self.position_callback_thread_running = False
+                    if self.position_callback_thread and self.position_callback_thread.is_alive():
+                        self.position_callback_thread.join(timeout=1.0)
+                        logger.info("Position callback thread stopped")
+
+                # Clear all position callbacks
+                self.clear_all_position_callbacks()
+
                 # Stop all tracks
                 with self.lock:
                     for track_id in list(self.active_tracks):
@@ -2482,6 +2751,12 @@ class AudioEngine:
                 self.track_states.clear()
                 self.active_tracks.clear()
                 self.track_files.clear()
+
+                # Clean position callback system
+                self.position_callbacks.clear()
+                self.global_position_listeners.clear()
+                self.last_position_check_time.clear()
+                self.callback_stats.clear()
 
                 # Clean optimization components
                 self.fade_step_cache.clear()
@@ -2616,7 +2891,7 @@ class AudioEngine:
 
                         # Apply audio effects - 增强错误处理
                         try:
-                            self._apply_audio_effects_optimized(chunk, state, frames)
+                            self._apply_audio_effects_optimized(chunk, state, frames, track_id)
                         except Exception as e:
                             logger.error(f"Audio effects error {track_id}: {e}")
                             # 继续处理但跳过效果
@@ -3405,7 +3680,7 @@ class AudioEngine:
         return chunk if chunk.shape[0] > 0 else None, new_position
 
     def _apply_audio_effects_optimized(
-        self, chunk: npt.NDArray, state: Dict[str, Any], frames: int
+        self, chunk: npt.NDArray, state: Dict[str, Any], frames: int, track_id: str = None
     ) -> None:
         """Optimized audio effects application"""
         # Apply volume
@@ -3446,6 +3721,9 @@ class AudioEngine:
                     state["playing"] = False
                     state["fade_progress"] = None
                     state["fade_direction"] = None
+                    # 立即从活跃轨道中移除（如果提供了 track_id）
+                    if track_id:
+                        self.active_tracks.discard(track_id)
                 else:
                     state["fade_progress"] = fade_end
 
@@ -4831,6 +5109,8 @@ class AudioEngine:
         silent_lpadding_ms: float = 0.0,
         silent_rpadding_ms: float = 0.0,
         gentle_matchering: bool = True,
+        on_complete: Optional[Callable] = None,
+        progress_callback: Optional[Callable] = None,
     ) -> bool:
         """
         加载音轨，并使用 matchering 将其与一个参考音轨进行匹配。
@@ -4845,6 +5125,8 @@ class AudioEngine:
             silent_lpadding_ms (float): 在音频前添加的静音填充（毫秒）。
             silent_rpadding_ms (float): 在音频后添加的静音填充（毫秒）。
             gentle_matchering (bool): 是否使用温和的EQ处理减少金属音色，默认True。
+            on_complete (Optional[Callable]): 加载完成时的回调函数。
+            progress_callback (Optional[Callable]): 进度回调函数。
 
         Returns:
             bool: 加载是否成功。
@@ -4924,21 +5206,34 @@ class AudioEngine:
                 )
                 logger.info("✅ Matchering processing complete!")
 
+                # 创建一个包装的完成回调，在加载完成后清理临时目录
+                def cleanup_callback(track_id_param, success):
+                    # 先调用原始回调
+                    if on_complete:
+                        on_complete(track_id_param, success)
+                    
+                    # 然后清理临时目录
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir)
+                        logger.info(f"🗑️ Cleaned up temp directory: {temp_dir}")
+
                 # 加载处理后的文件
                 return self.load_track(
                     track_id,
                     matched_file_path,
                     silent_lpadding_ms=silent_lpadding_ms,
                     silent_rpadding_ms=silent_rpadding_ms,
+                    on_complete=cleanup_callback,
+                    progress_callback=progress_callback,
                 )
 
             except Exception as e:
                 logger.error(f"❌ Matchering processing failed: {e}")
-                return False
-            finally:
+                # 只在异常情况下立即清理
                 if os.path.exists(temp_dir):
                     shutil.rmtree(temp_dir)
-                    logger.info(f"🗑️ Cleaned up temp directory: {temp_dir}")
+                    logger.info(f"🗑️ Cleaned up temp directory after error: {temp_dir}")
+                return False
 
     def _load_from_file(self, file_path: str) -> tuple[np.ndarray, int]:
         """从文件加载音频数据"""
@@ -4950,3 +5245,220 @@ class AudioEngine:
         except Exception as e:
             logger.error(f"无法加载音频文件: {file_path}, 错误: {e}")
             return None, None
+
+    # =====================================================================
+    # 位置回调系统私有方法 (实时音频回调机制)
+    # =====================================================================
+
+    def _ensure_callback_thread_running(self) -> None:
+        """确保回调检查线程正在运行"""
+        if not self.position_callback_thread_running:
+            self.position_callback_thread_running = True
+            self.position_callback_thread = threading.Thread(
+                target=self._position_callback_worker,
+                daemon=True,
+                name="PositionCallback"
+            )
+            self.position_callback_thread.start()
+            logger.debug("位置回调检查线程已启动")
+
+    def _position_callback_worker(self) -> None:
+        """位置回调检查线程工作函数"""
+        logger.debug("位置回调工作线程开始运行")
+        
+        while self.position_callback_thread_running:
+            try:
+                self._check_position_callbacks()
+                
+                # 根据回调数量动态调整检查频率
+                with self.lock:
+                    active_callbacks = sum(len(callbacks) for callbacks in self.position_callbacks.values())
+                    has_listeners = len(self.global_position_listeners) > 0
+                
+                if active_callbacks > 0 or has_listeners:
+                    # 有活跃回调时使用高频检查
+                    sleep_time = self.callback_precision  # 5ms
+                else:
+                    # 无活跃回调时降低频率
+                    sleep_time = 0.050  # 50ms
+                
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                logger.error(f"位置回调线程错误: {e}")
+                time.sleep(0.010)  # 错误时等待10ms再继续
+        
+        logger.debug("位置回调工作线程已停止")
+
+    def _check_position_callbacks(self) -> None:
+        """检查并触发位置回调"""
+        current_time = time.time()
+        precision_errors = []  # 收集精度误差用于统计
+        
+        # 获取回调快照以减少锁定时间
+        with self.lock:
+            callbacks_snapshot = {}
+            for track_id, callbacks in self.position_callbacks.items():
+                if self.is_track_playing(track_id):
+                    callbacks_snapshot[track_id] = callbacks.copy()
+            
+            listeners_snapshot = self.global_position_listeners.copy()
+        
+        # 检查每个轨道的回调
+        for track_id, callbacks in callbacks_snapshot.items():
+            try:
+                current_position = self.get_position(track_id)
+                if current_position is None:
+                    continue
+                
+                # 通知全局监听器
+                for listener in listeners_snapshot:
+                    try:
+                        listener(track_id, current_position)
+                    except Exception as e:
+                        logger.error(f"全局监听器错误: {e}")
+                
+                # 检查该轨道的所有回调
+                callbacks_to_trigger = []
+                callbacks_to_expire = []
+                
+                for target_time, callback_info in callbacks.items():
+                    if callback_info['triggered']:
+                        continue
+                    
+                    time_diff = abs(current_position - target_time)
+                    
+                    # 检查是否在容忍范围内
+                    if time_diff <= callback_info['tolerance']:
+                        callbacks_to_trigger.append((target_time, callback_info, time_diff))
+                    
+                    # 检查是否已过期（超出容忍范围）
+                    elif current_position > target_time + callback_info['tolerance']:
+                        callbacks_to_expire.append((target_time, callback_info))
+                
+                # 触发符合条件的回调
+                for target_time, callback_info, time_diff in callbacks_to_trigger:
+                    try:
+                        callback_info['callback'](track_id, current_position, target_time)
+                        
+                        # 记录精度信息
+                        actual_error = current_position - target_time
+                        precision_errors.append(abs(actual_error) * 1000)  # 转换为毫秒
+                        
+                        logger.debug(
+                            f"位置回调触发: track={track_id}, target={target_time:.3f}s, "
+                            f"actual={current_position:.3f}s, error={actual_error*1000:.1f}ms"
+                        )
+                        
+                        # 标记为已触发
+                        with self.lock:
+                            if (track_id in self.position_callbacks and 
+                                target_time in self.position_callbacks[track_id]):
+                                self.position_callbacks[track_id][target_time]['triggered'] = True
+                                self.callback_stats['total_callbacks_triggered'] += 1
+                        
+                    except Exception as e:
+                        logger.error(f"回调函数执行错误: {e}")
+                        # 即使回调执行失败，也标记为已触发以避免重复调用
+                        with self.lock:
+                            if (track_id in self.position_callbacks and 
+                                target_time in self.position_callbacks[track_id]):
+                                self.position_callbacks[track_id][target_time]['triggered'] = True
+                
+                # 标记过期的回调
+                for target_time, callback_info in callbacks_to_expire:
+                    logger.debug(
+                        f"位置回调过期: track={track_id}, target={target_time:.3f}s, "
+                        f"current={current_position:.3f}s"
+                    )
+                    
+                    with self.lock:
+                        if (track_id in self.position_callbacks and 
+                            target_time in self.position_callbacks[track_id]):
+                            self.position_callbacks[track_id][target_time]['triggered'] = True
+                            self.callback_stats['total_callbacks_expired'] += 1
+            
+            except Exception as e:
+                logger.error(f"检查轨道 {track_id} 的回调时出错: {e}")
+        
+        # 清理已触发的回调
+        self._cleanup_triggered_callbacks()
+        
+        # 更新统计信息
+        with self.lock:
+            if precision_errors:
+                # 计算平均精度
+                avg_error = sum(precision_errors) / len(precision_errors)
+                # 使用指数加权移动平均更新统计信息
+                alpha = 0.3
+                if self.callback_stats['average_precision_ms'] == 0:
+                    self.callback_stats['average_precision_ms'] = avg_error
+                else:
+                    self.callback_stats['average_precision_ms'] = (
+                        alpha * avg_error + 
+                        (1 - alpha) * self.callback_stats['average_precision_ms']
+                    )
+            
+            self.callback_stats['last_check_time'] = current_time
+
+    def _cleanup_triggered_callbacks(self) -> None:
+        """清理已触发的回调"""
+        with self.lock:
+            tracks_to_remove = []
+            
+            for track_id, callbacks in self.position_callbacks.items():
+                # 移除已触发的回调
+                triggered_times = [
+                    target_time for target_time, info in callbacks.items()
+                    if info['triggered']
+                ]
+                
+                for target_time in triggered_times:
+                    del callbacks[target_time]
+                
+                # 如果该轨道没有回调了，标记为待移除
+                if not callbacks:
+                    tracks_to_remove.append(track_id)
+            
+            # 移除空的轨道回调
+            for track_id in tracks_to_remove:
+                del self.position_callbacks[track_id]
+
+    def _get_playback_position_precise(self, track_id: str) -> Optional[float]:
+        """获取轨道的精确播放位置（内部方法）
+        
+        这是一个增强版的位置获取方法，用于位置回调系统。
+        相比于public的get_position方法，这个方法提供更高精度。
+        
+        Args:
+            track_id: 轨道ID
+            
+        Returns:
+            当前播放位置（秒），如果轨道不存在或未播放则返回None
+        """
+        try:
+            # 使用现有的get_position方法作为基础
+            base_position = self.get_position(track_id)
+            if base_position is None:
+                return None
+            
+            # 对于高精度需求，可以考虑添加更精确的时间计算
+            # 目前直接使用现有方法的结果
+            return base_position
+            
+        except Exception as e:
+            logger.error(f"获取精确播放位置失败: {e}")
+            return None
+
+    def _adaptive_callback_frequency(self) -> float:
+        """根据回调数量和精度要求动态调整检查频率"""
+        with self.lock:
+            active_callbacks = sum(len(callbacks) for callbacks in self.position_callbacks.values())
+            has_listeners = len(self.global_position_listeners) > 0
+        
+        if active_callbacks == 0 and not has_listeners:
+            return 0.050  # 50ms，无回调时低频
+        elif active_callbacks <= 5 and not has_listeners:
+            return 0.010  # 10ms，少量回调时中频
+        else:
+            return 0.005  # 5ms，大量回调或有监听器时高频

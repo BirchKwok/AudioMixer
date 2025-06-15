@@ -27,7 +27,38 @@ class AudioProcessor:
             >>> fade_env = np.linspace(0.0, 1.0, 1024)  # 淡入
             >>> AudioProcessor.apply_fade_inplace(audio_chunk, fade_env)
         """
-        chunk *= fade_env[:, np.newaxis]
+        # 确保 fade_env 的形状正确
+        if fade_env.ndim == 1:
+            # 一维数组，需要添加新轴以匹配音频数据的形状
+            if len(fade_env) == chunk.shape[0]:
+                chunk *= fade_env[:, np.newaxis]
+            else:
+                # 长度不匹配，调整 fade_env 长度
+                fade_env_resized = np.interp(
+                    np.linspace(0, len(fade_env) - 1, chunk.shape[0]),
+                    np.arange(len(fade_env)),
+                    fade_env
+                )
+                chunk *= fade_env_resized[:, np.newaxis]
+        elif fade_env.ndim == 2:
+            # 二维数组，直接使用
+            if fade_env.shape == chunk.shape:
+                chunk *= fade_env
+            else:
+                # 形状不匹配，尝试广播
+                try:
+                    chunk *= fade_env
+                except ValueError:
+                    # 广播失败，使用第一列或平均值
+                    if fade_env.shape[0] == chunk.shape[0]:
+                        fade_1d = fade_env[:, 0] if fade_env.shape[1] > 0 else np.ones(chunk.shape[0])
+                        chunk *= fade_1d[:, np.newaxis]
+                    else:
+                        # 完全不匹配，使用默认值
+                        chunk *= 1.0
+        else:
+            # 其他情况，不应用淡入淡出
+            pass
 
     @staticmethod
     def apply_volume_inplace(chunk: npt.NDArray, volume: float) -> None:

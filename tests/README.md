@@ -289,4 +289,127 @@ pytest tests/ -s
 
 ---
 
-**注意**: 此测试套件需要真实的音频设备和相关权限。在 CI/CD 环境中可能需要特殊配置。 
+**注意**: 此测试套件需要真实的音频设备和相关权限。在 CI/CD 环境中可能需要特殊配置。
+
+## 位置回调测试 (test_position_callbacks.py)
+
+专门测试实时音频位置回调机制的测试文件，包含以下测试类：
+
+### TestBasicPositionCallbacks
+- 基本回调注册和移除功能
+- 回调清理功能
+- 回调存储验证
+
+### TestCallbackPrecision  
+- 回调触发时间精度测试
+- 不同容忍度设置测试
+- 5-20ms精度要求验证
+
+### TestMultiTrackCallbacks
+- 多轨道同时回调功能
+- 轨道间回调隔离测试
+- 并发播放回调验证
+
+### TestGlobalPositionListeners
+- 全局位置监听器注册/移除
+- 全局监听器功能验证
+- 位置数据收集测试
+
+### TestCallbackStatistics
+- 回调统计信息验证
+- 性能指标测试
+- 统计数据结构检查
+
+### TestErrorHandling
+- 无效轨道回调处理
+- 回调函数异常处理
+- 错误边界条件测试
+
+### TestPerformanceAndMemory
+- 大量回调性能测试
+- 内存清理验证
+- 线程资源管理
+
+### TestCallbackThreadBehavior
+- 回调线程启动验证
+- 自适应频率调整测试
+- 线程生命周期管理
+
+## 运行测试
+
+```bash
+# 运行所有测试
+python -m pytest tests/ -v
+
+# 运行位置回调测试
+python -m pytest tests/test_position_callbacks.py -v
+
+# 运行特定测试类
+python -m pytest tests/test_position_callbacks.py::TestCallbackPrecision -v
+
+# 运行精度测试
+python -c "from tests.test_position_callbacks import run_precision_test; run_precision_test()"
+
+# 运行性能测试  
+python -c "from tests.test_position_callbacks import run_performance_test; run_performance_test()"
+```
+
+## 测试覆盖
+
+位置回调测试覆盖了以下API：
+
+- `register_position_callback()` - 注册位置回调
+- `remove_position_callback()` - 移除位置回调
+- `add_global_position_listener()` - 添加全局监听器
+- `remove_global_position_listener()` - 移除全局监听器
+- `clear_all_position_callbacks()` - 清空所有回调
+- `get_position_callback_stats()` - 获取回调统计
+
+## 测试环境要求
+
+- Python 3.8+
+- pytest
+- numpy
+- realtimemix 音频引擎
+- 音频设备（用于实际播放测试）
+
+## 注意事项
+
+1. **音频设备**: 测试需要可用的音频输出设备
+2. **测试时间**: 完整测试套件需要约2-3分钟
+3. **并发测试**: 某些测试涉及实际音频播放，可能受系统负载影响
+4. **精度要求**: 在不同系统上，回调精度可能略有差异（通常在5-20ms范围内）
+
+## 故障排除
+
+如果测试失败：
+
+1. 检查音频设备是否可用
+2. 确认系统负载不过高
+3. 验证依赖包版本
+4. 查看测试日志中的具体错误信息
+
+## 开发指南
+
+添加新的位置回调测试时：
+
+1. 继承适当的测试基类
+2. 使用 `CallbackTracker` 工具类跟踪回调
+3. 考虑测试环境的性能限制
+4. 添加适当的错误处理测试
+5. 确保测试清理资源
+
+## 配置
+
+测试配置位于：
+- `conftest.py` - pytest 配置和共享fixtures
+- `pytest.ini` - pytest 运行配置
+- `requirements-test.txt` - 测试依赖包
+
+## 持续集成
+
+这些测试设计为在CI环境中运行，包括：
+- 自动资源清理
+- 合理的超时设置
+- 跨平台兼容性
+- 错误容忍机制 
